@@ -1,0 +1,91 @@
+# Shared matplotlib style for the SHB figures.
+#
+# Ported from SHsimulation_v1_7.ipynb cell 4, which is the written-out form of
+# the "signature.mplstyle" / "signaturempl.txt" sheet the notebooks reference
+# (SHsimulation_v1_3test2multi.ipynb does `plt.style.use("signaturempl.txt")`).
+# Text is Times New Roman with STIX maths so the two match on any machine.
+
+# --- figure ---------------------------------------------------------------
+figure.figsize:      8, 5
+figure.dpi:          150
+figure.facecolor:    white
+figure.edgecolor:    white
+figure.autolayout:   False
+
+# --- text --------------------------------------------------------------
+font.family:         serif
+font.serif:          Times New Roman, DejaVu Serif
+font.size:           12
+text.usetex:         False
+mathtext.fontset:    stix
+
+# --- axes --------------------------------------------------------------
+axes.facecolor:              white
+axes.edgecolor:              0.15
+axes.linewidth:              1.2
+axes.grid:                   True
+axes.grid.which:             major
+axes.axisbelow:              True
+axes.titlesize:              12
+axes.titleweight:            bold
+axes.titlepad:               8
+axes.labelsize:              12
+axes.labelpad:               5
+axes.spines.top:             False
+axes.spines.right:           False
+axes.formatter.use_mathtext: True
+axes.prop_cycle:             cycler('color', ['1f77b4', 'e05c2a', '2ca02c', '9467bd', '8c564b', 'd62728', '17becf', 'bcbd22'])
+
+# --- grid ---------------------------------------------------------------
+grid.color:      0.85
+grid.linestyle:  -
+grid.linewidth:  0.6
+grid.alpha:      0.7
+
+# --- lines ------------------------------------------------------------
+lines.linewidth:       2
+lines.markersize:      5
+lines.markeredgewidth: 0.8
+
+# --- ticks (minor on, pointing in) ----------------------------------
+xtick.direction:     in
+ytick.direction:     in
+xtick.major.size:    4.5
+ytick.major.size:    4.5
+xtick.minor.size:    2.5
+ytick.minor.size:    2.5
+xtick.major.width:   1.1
+ytick.major.width:   1.1
+xtick.minor.width:   0.8
+ytick.minor.width:   0.8
+xtick.minor.visible: True
+ytick.minor.visible: True
+xtick.labelsize:     10
+ytick.labelsize:     10
+
+# --- legend ---------------------------------------------------------
+legend.fontsize:     12
+legend.frameon:      True
+legend.framealpha:   1.0
+legend.facecolor:    white
+legend.edgecolor:    black
+legend.fancybox:     True
+legend.shadow:       True
+legend.borderpad:    0.5
+legend.labelspacing: 0.4
+legend.handlelength: 1.8
+legend.loc:          best
+
+# --- images (the heatmap) ----------------------------------------
+image.cmap:          inferno
+image.interpolation: nearest
+image.aspect:        auto
+image.origin:        lower
+
+# --- saving --------------------------------------------------------
+savefig.dpi:        300
+savefig.bbox:       tight
+savefig.pad_inches: 0.05
+savefig.facecolor:  white
+savefig.edgecolor:  white
+savefig.format:     png
