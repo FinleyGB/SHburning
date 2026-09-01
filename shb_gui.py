@@ -36,12 +36,30 @@ import traceback
 
 import numpy as np
 
-import matplotlib
-matplotlib.use("QtAgg")
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg  # noqa: E402
-from matplotlib.backends.backend_qt import NavigationToolbar2QT  # noqa: E402
-from matplotlib.figure import Figure  # noqa: E402
+if sys.platform == "win32":  # noqa: E402
+    # A conda/Anaconda install can ship its own Qt6Core.dll (e.g. under
+    # <prefix>/Library/bin, alongside PyQt5/PySide6) that is binary-
+    # incompatible with the one bundled inside the PyQt6 wheel. If that
+    # DLL gets resolved instead, importing PyQt6.QtCore fails with
+    # "DLL load failed ... The specified procedure could not be found."
+    # Force PyQt6's own Qt6Core.dll to load first, from its own folder
+    # (winmode=0 lets it find its sibling DLLs there), before anything
+    # else on the system gets a chance to shadow it.
+    import PyQt6
+    _qt6_bin = os.path.join(os.path.dirname(PyQt6.__file__), "Qt6", "bin")
+    if os.path.isdir(_qt6_bin):
+        os.add_dll_directory(_qt6_bin)
+        import ctypes
+        _qt6_core = os.path.join(_qt6_bin, "Qt6Core.dll")
+        if os.path.isfile(_qt6_core):
+            ctypes.WinDLL(_qt6_core, winmode=0)
 
+# Import PyQt6 before matplotlib: matplotlib's QtAgg backend binds to
+# whichever Qt binding is already in sys.modules (checking PyQt6, PySide6,
+# PyQt5, PySide2 in that order), so if another binding is also installed
+# (e.g. a conda env's own PyQt5) and PyQt6 isn't imported first, matplotlib
+# can silently pick the wrong major version and crash on mismatched Qt
+# instances.
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal  # noqa: E402
 from PyQt6.QtGui import QAction  # noqa: E402
 from PyQt6.QtWidgets import (  # noqa: E402
