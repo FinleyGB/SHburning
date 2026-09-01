@@ -36,30 +36,12 @@ import traceback
 
 import numpy as np
 
-if sys.platform == "win32":  # noqa: E402
-    # A conda/Anaconda install can ship its own Qt6Core.dll (e.g. under
-    # <prefix>/Library/bin, alongside PyQt5/PySide6) that is binary-
-    # incompatible with the one bundled inside the PyQt6 wheel. If that
-    # DLL gets resolved instead, importing PyQt6.QtCore fails with
-    # "DLL load failed ... The specified procedure could not be found."
-    # Force PyQt6's own Qt6Core.dll to load first, from its own folder
-    # (winmode=0 lets it find its sibling DLLs there), before anything
-    # else on the system gets a chance to shadow it.
-    import PyQt6
-    _qt6_bin = os.path.join(os.path.dirname(PyQt6.__file__), "Qt6", "bin")
-    if os.path.isdir(_qt6_bin):
-        os.add_dll_directory(_qt6_bin)
-        import ctypes
-        _qt6_core = os.path.join(_qt6_bin, "Qt6Core.dll")
-        if os.path.isfile(_qt6_core):
-            ctypes.WinDLL(_qt6_core, winmode=0)
+import matplotlib
+matplotlib.use("QtAgg")
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg  # noqa: E402
+from matplotlib.backends.backend_qt import NavigationToolbar2QT  # noqa: E402
+from matplotlib.figure import Figure  # noqa: E402
 
-# Import PyQt6 before matplotlib: matplotlib's QtAgg backend binds to
-# whichever Qt binding is already in sys.modules (checking PyQt6, PySide6,
-# PyQt5, PySide2 in that order), so if another binding is also installed
-# (e.g. a conda env's own PyQt5) and PyQt6 isn't imported first, matplotlib
-# can silently pick the wrong major version and crash on mismatched Qt
-# instances.
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal  # noqa: E402
 from PyQt6.QtGui import QAction  # noqa: E402
 from PyQt6.QtWidgets import (  # noqa: E402
@@ -67,7 +49,7 @@ from PyQt6.QtWidgets import (  # noqa: E402
     QGroupBox, QComboBox, QCheckBox, QPushButton, QLabel, QLineEdit, QSpinBox,
     QDoubleSpinBox, QPlainTextEdit, QStackedWidget, QProgressBar, QFileDialog,
     QMessageBox, QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem,
-    QTabWidget)
+    QTabWidget, QScrollArea, QSizePolicy)
 
 import matplotlib  # noqa: E402
 matplotlib.use("QtAgg")
@@ -142,8 +124,11 @@ class SimWorker(QObject):
 
             burn = shb.burn_series if burn_name == "series" else shb.burn_parallel
             self.log.emit(summary)
+            n_pf = int(np.atleast_1d(pump_freqs).size)
+            self.log.emit(f"burning {n_pf} pump frequencies...")
             out = shb.run_burn(pump_freqs, params, burn=burn,
                                pump_passes=pump_passes)
+            self.log.emit("spectrum done")
             spec = out["spec"]
             p = shb.settings(params)
             self.log.emit(
@@ -175,7 +160,7 @@ class SimWorker(QObject):
             if best:
                 b = best[0]
                 self.log.emit(
-                    f"[{scan['tag']}] best: AFC contrast {b['contrast']:.3f} at "
+                    f"[{scan['tag']}] best: AFC comb quality {b['quality']:.3f} at "
                     f"t_s {b['storage_us']:.3g} us, F {b['finesse']:.1f} "
                     f"(spacing {b['spacing_MHz']:.3f} MHz, "
                     f"width {b['width_MHz']:.3f} MHz)")
@@ -202,7 +187,7 @@ class StackedPlot(QWidget):
 
     Burn / preview: pump comb on top, spectrum below, sharing the Frequency
     axis (zoom or pan either and both move). Scan: a single full-height axis
-    for the heatmap / best-contrast / top-spectra views.
+    for the quality heatmap / quality-vs-storage / top-spectra views.
 
     Left-drag across the plot to zoom the x-axis (as in the plotly figures of
     SHsimulation_v1_3test2multi.ipynb); double-click or the Home button resets.
@@ -229,14 +214,113 @@ class StackedPlot(QWidget):
         box = QVBoxLayout(self)
         box.setContentsMargins(0, 0, 0, 0)
         box.addLayout(bar)
-        box.addWidget(self.canvas)
+
+        content = QHBoxLayout()
+        content.setContentsMargins(0, 0, 0, 0)
+        content.addWidget(self.canvas, stretch=1)
+        self._legend_panel = self._build_legend_panel()
+        self._legend_panel.hide()
+        content.addWidget(self._legend_panel)
+        box.addLayout(content)
+
         self.canvas.setMinimumHeight(460)
+        self.canvas.setMinimumWidth(360)
+        self._top_lines = []
+        self._top_checks = []
 
         self.canvas.mpl_connect("button_press_event", self._on_click)
+
+    # -- detachable legend for the top-spectra view --------------------
+
+    def _build_legend_panel(self):
+        w = QWidget()
+        w.setMaximumWidth(260)
+        w.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        v = QVBoxLayout(w)
+        v.setContentsMargins(2, 2, 2, 2)
+
+        hdr = QHBoxLayout()
+        hdr.addWidget(QLabel("Traces"))
+        hdr.addStretch(1)
+        all_btn = QPushButton("All")
+        none_btn = QPushButton("None")
+        for b in (all_btn, none_btn):
+            b.setMaximumWidth(48)
+        all_btn.clicked.connect(lambda: self._set_all_traces(True))
+        none_btn.clicked.connect(lambda: self._set_all_traces(False))
+        hdr.addWidget(all_btn)
+        hdr.addWidget(none_btn)
+        v.addLayout(hdr)
+
+        self._legend_scroll = QScrollArea()
+        self._legend_scroll.setWidgetResizable(True)
+        inner = QWidget()
+        self._legend_box = QVBoxLayout(inner)
+        self._legend_box.setContentsMargins(0, 0, 0, 0)
+        self._legend_box.addStretch(1)          # trailing spacer, kept
+        self._legend_scroll.setWidget(inner)
+        v.addWidget(self._legend_scroll)
+        return w
+
+    def _clear_legend_panel(self):
+        while self._legend_box.count() > 1:     # leave the trailing stretch
+            item = self._legend_box.takeAt(0)
+            if item is None:
+                break
+            wdg = item.widget()
+            if wdg is not None:
+                wdg.deleteLater()
+        self._top_checks = []
+        self._top_lines = []
+
+    def _populate_legend_panel(self, lines, labels):
+        self._clear_legend_panel()
+        self._top_lines = list(lines)
+        for ln, lab in zip(lines, labels):
+            text = lab.replace("$\\mu$s", "us").replace("$\\mu$", "u")
+            cb = QCheckBox(text)
+            cb.setChecked(ln.get_visible())
+            cb.setStyleSheet(f"color:{mcolors.to_hex(ln.get_color())}")
+            cb.toggled.connect(
+                lambda on, l=ln: (l.set_visible(on), self._autoscale_top_y()))
+            self._legend_box.insertWidget(self._legend_box.count() - 1, cb)
+            self._top_checks.append(cb)
+        self._legend_panel.show()
+
+    def _set_all_traces(self, on):
+        for cb, ln in zip(self._top_checks, self._top_lines):
+            cb.blockSignals(True)
+            cb.setChecked(on)
+            cb.blockSignals(False)
+            ln.set_visible(on)
+        self._autoscale_top_y()
+
+    def _autoscale_top_y(self):
+        """Rescale y to the visible top-spectra traces, keeping the x-range."""
+        if not self._axes or not self._top_lines:
+            return
+        ax = self._axes[-1]
+        x0, x1 = sorted(ax.get_xlim())
+        lo, hi = np.inf, -np.inf
+        for ln in self._top_lines:
+            if not ln.get_visible():
+                continue
+            xd = np.asarray(ln.get_xdata(), dtype=float)
+            yd = np.asarray(ln.get_ydata(), dtype=float)
+            m = (xd >= x0) & (xd <= x1)
+            if m.any():
+                lo = min(lo, float(np.nanmin(yd[m])))
+                hi = max(hi, float(np.nanmax(yd[m])))
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+            pad = 0.05 * (hi - lo)
+            ax.set_ylim(lo - pad, hi + pad)
+        self.canvas.draw_idle()
 
     # -- drawing --------------------------------------------------------
 
     def _stacked_axes(self):
+        self._clear_legend_panel()
+        self._legend_panel.hide()
         self.figure.clear()
         gs = self.figure.add_gridspec(2, 1, height_ratios=[1, 3], hspace=0.08)
         ax_top = self.figure.add_subplot(gs[0])
@@ -285,18 +369,29 @@ class StackedPlot(QWidget):
         self._finish()
 
     def show_scan(self, scan, view):
+        self._clear_legend_panel()
         self.figure.clear()
         ax = self.figure.add_subplot(111)
         self._axes = [ax]
         try:
-            (shb.plot_scan_heatmap, shb.plot_scan_max,
-             shb.plot_top_spectra)[view](ax, scan)
+            if view == 0:
+                shb.plot_scan_heatmap(ax, scan)
+            elif view == 1:
+                shb.plot_scan_max(ax, scan)
+            else:
+                _, lines, labels = shb.plot_top_spectra(ax, scan, legend=False)
+                self._populate_legend_panel(lines, labels)
+            if view != 2:
+                self._legend_panel.hide()
         except Exception as exc:                        # noqa: BLE001
+            self._legend_panel.hide()
             ax.text(0.5, 0.5, str(exc), ha="center", va="center",
                     transform=ax.transAxes)
         self._finish()
 
     def show_message(self, text):
+        self._clear_legend_panel()
+        self._legend_panel.hide()
         self.figure.clear()
         ax = self.figure.add_subplot(111)
         self._axes = [ax]
@@ -502,8 +597,9 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.addWidget(QLabel("Scan view:"))
         self.scan_view = QComboBox()
-        self.scan_view.addItems(["Contrast heatmap",
-                                 "Best contrast vs storage time", "Top spectra"])
+        self.scan_view.addItems(["Comb-quality heatmap",
+                                 "Quality vs storage time (best/mean/worst)",
+                                 "Top spectra"])
         self.scan_view.setEnabled(False)
         self.scan_view.currentIndexChanged.connect(self._draw_feature)
         row.addWidget(self.scan_view)
@@ -631,7 +727,8 @@ class MainWindow(QMainWindow):
         self.top_n = _ispin(1, 5000, 50)
         self.parallel_check = QCheckBox("multiprocessing")
         self.parallel_check.setChecked(True)
-        self.workers = _ispin(1, (os.cpu_count() or 1) * 2, os.cpu_count() or 1)
+        _cpu = os.cpu_count() or 1
+        self.workers = _ispin(1, _cpu * 2, max(1, _cpu - 1))
         self.parallel_check.stateChanged.connect(
             lambda s: self.workers.setEnabled(bool(s)))
         for w in (self.storage_min, self.storage_max,
@@ -646,7 +743,7 @@ class MainWindow(QMainWindow):
         sc_form.addRow("target window (MHz)", self.target_window)
         sc_form.addRow("keep top N", self.top_n)
         sc_form.addRow(self.parallel_check)
-        sc_form.addRow("workers", self.workers)
+        sc_form.addRow(f"workers (of {_cpu})", self.workers)
         self.stack.addWidget(sc)
 
         outer.addWidget(self.stack)
@@ -945,7 +1042,15 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Simulation error", msg)
 
     def _append_log(self, line):
-        self.log_view.appendPlainText(line.rstrip())
+        stamp = time.strftime("%H:%M:%S")
+        if self._job_kind is not None and self._job_t0:
+            el = max(0.0, time.monotonic() - self._job_t0)
+            pre = f"{stamp} +{int(el) // 60:02d}:{int(el) % 60:02d}  "
+        else:
+            pre = f"{stamp}  "
+        text = "" if line is None else str(line)
+        for phys in text.split("\n"):
+            self.log_view.appendPlainText(pre + phys.rstrip())
 
     # -- plot --------------------------------------------------
 
@@ -1098,7 +1203,7 @@ class MainWindow(QMainWindow):
             note(f"{base}_plot.png")
             if self._scan is not None:
                 for name, fn in (("heatmap", shb.plot_scan_heatmap),
-                                 ("bestcontrast", shb.plot_scan_max),
+                                 ("quality_vs_storage", shb.plot_scan_max),
                                  ("topspectra", shb.plot_top_spectra)):
                     fig = Figure(figsize=(8, 4), constrained_layout=True)
                     fn(fig.add_subplot(111), self._scan)
@@ -1109,7 +1214,7 @@ class MainWindow(QMainWindow):
             if self._scan is not None:
                 path = f"{base}_results.csv"
                 cols = ["spacing_MHz", "width_MHz", "finesse",
-                        "storage_us", "contrast"]
+                        "storage_us", "quality"]
                 with open(path, "w", newline="") as fh:
                     w = csv.DictWriter(fh, fieldnames=cols)
                     w.writeheader()

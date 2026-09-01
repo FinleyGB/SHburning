@@ -712,25 +712,93 @@ def comb_at(tooth_spacing, burn_width, params):
 # Scan
 # ===========================================================================
 
-def _score_contrast(f, spec, target_window, a_ref):
-    """
-    AFC contrast over ``target_window`` MHz at the centre of ``f``.
+def _fmt_dur(seconds):
+    """A compact ``1h04m`` / ``3m20s`` / ``12s`` duration for the run log."""
+    s = int(max(0.0, seconds))
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
 
-    ``C = (A_max - A_min) / (2 * A_unburned)`` over the window - the Michelson
-    visibility of the comb with the background pinned to the unburned absorption
-    level (``a_ref``) instead of estimated per point as ``(A_max + A_min) / 2``.
-    Because ``a_ref`` is fixed for the whole sweep, C is a strict rescaling of
-    the raw delta absorption ``A_max - A_min`` and ranks the scan identically.
+
+def _score_quality(f, spec, target_window, spacing_mhz):
     """
-    if a_ref <= 0.0:
-        return 0.0
+    AFC comb-quality score over ``target_window`` MHz at the centre of ``f``.
+
+    A clean broadband AFC has regular, equal-height teeth with deep flat dips; a
+    bad one has irregular teeth, ringing / sub-structure, aperiodic baseline
+    wander or a low duty cycle. A plain Michelson visibility
+    ``(A_max - A_min) / (A_max + A_min)`` cannot tell them apart - both hit the
+    same extreme samples. This score multiplies three factors, each in ``[0, 1]``,
+    so a comb has to be deep *and* regular *and* spectrally clean to score well::
+
+        Q = mean_j(v_j) * uniformity * purity
+
+    where the window is cropped to a whole number of tooth periods
+    (``spacing_mhz`` is the known tooth spacing, so ``per = spacing_mhz / df`` is
+    an exact integer and there is no spectral leakage):
+
+    * ``v_j = (p95_j - p05_j) / (p95_j + p05_j)`` is the robust per-period depth
+      (5th/95th percentiles, so ringing spikes do not dominate);
+    * ``uniformity = 1 - std(peak_j) / mean(peak_j)`` with ``peak_j`` the per-period
+      95th percentile - penalises tooth-to-tooth height scatter;
+    * ``purity = (A1 / sqrt(2)) / rms(spec - mean)`` is the fraction of the
+      windowed AC power sitting in the fundamental comb period ``A1`` (a single-bin
+      DFT at ``spacing_mhz``) - ringing, sub-structure and aperiodicity all leak
+      power off the fundamental and drop it.
+
+    With fewer than two whole periods in the window there is no comb to speak of
+    and the score falls back to the robust whole-window depth alone.
+    """
+    f = np.asarray(f)
+    spec = np.asarray(spec, dtype=float)
     centre = f[len(f) // 2]
-    lo = np.searchsorted(f, centre - target_window / 2)
-    hi = np.searchsorted(f, centre + target_window / 2)
+    lo = int(np.searchsorted(f, centre - target_window / 2))
+    hi = int(np.searchsorted(f, centre + target_window / 2))
     seg = spec[lo:hi]
+    fseg = f[lo:hi]
     if seg.size == 0:
         return 0.0
-    return float(seg.max() - seg.min()) / (2.0 * a_ref)
+
+    p05, p95 = np.percentile(seg, [5.0, 95.0])
+    if p95 + p05 <= 0.0:
+        return 0.0
+    depth = float(np.clip((p95 - p05) / (p95 + p05), 0.0, 1.0))
+
+    df_seg = float(fseg[1] - fseg[0]) if fseg.size >= 2 else 0.0
+    if not (spacing_mhz and spacing_mhz > 0.0 and df_seg > 0.0):
+        return depth
+    per = int(round(spacing_mhz / df_seg))            # == spacing_steps (exact)
+    n_per = seg.size // per if per > 0 else 0
+    if per < 2 or n_per < 2:                          # < 2 teeth in the window
+        return depth
+
+    keep = n_per * per
+    s = seg[:keep]
+    x = fseg[:keep]
+
+    # per-period robust depth + tooth-height uniformity
+    chunks = s.reshape(n_per, per)
+    lo_j, hi_j = np.percentile(chunks, [5.0, 95.0], axis=1)
+    denom = hi_j + lo_j
+    v_j = np.where(denom > 0.0, (hi_j - lo_j) / denom, 0.0)
+    mean_peak = float(hi_j.mean())
+    uniformity = (1.0 - float(hi_j.std()) / mean_peak) if mean_peak > 0.0 else 0.0
+    uniformity = float(np.clip(uniformity, 0.0, 1.0))
+
+    # spectral purity: AC power fraction in the fundamental comb period
+    g = s - s.mean()
+    p_ac = float(np.sqrt(np.mean(g * g)))
+    if p_ac <= 0.0:
+        return 0.0
+    w = (2.0 * np.pi / spacing_mhz) * x
+    a1 = (2.0 / keep) * float(np.hypot(g @ np.cos(w), g @ np.sin(w)))
+    purity = float(np.clip((a1 / np.sqrt(2.0)) / p_ac, 0.0, 1.0))
+
+    return float(np.clip(float(v_j.mean()) * uniformity * purity, 0.0, 1.0))
 
 
 def _scan_context(params, burn, pump_passes, target_window):
@@ -744,20 +812,12 @@ def _scan_context(params, burn, pump_passes, target_window):
     rho0 = initial_populations(g, det)
     sctx = _SpectrumCtx(params, det, f)
 
-    # Unburned absorption over the judging window - the fixed reference the AFC
-    # contrast is normalised by, computed once so every point uses the same one.
-    spec0 = spectrum(rho0, trans, det, f, params, ctx=sctx)
-    centre = f[len(f) // 2]
-    lo = np.searchsorted(f, centre - target_window / 2)
-    hi = np.searchsorted(f, centre + target_window / 2)
-    a_ref = float(spec0[lo:hi].max()) if hi > lo else float(spec0.max())
-
     return {
         "params": params, "burn": burn, "pump_passes": pump_passes,
         "target_window": target_window, "df": settings(params)["df"],
         "trans": trans, "trans_steps": trans_steps,
         "f": f, "det": det, "det0": det0,
-        "rho0": rho0, "sctx": sctx, "a_ref": a_ref,
+        "rho0": rho0, "sctx": sctx,
     }
 
 
@@ -768,9 +828,9 @@ def compute_one(item, params=None, burn=None, pump_passes=None,
 
     ``item`` is ``(n, (spacing_steps, width_steps))``. Returns
     ``(result_row, record)`` where
-        result_row = (spacing_MHz, width_MHz, contrast)
-        record     = (contrast, n, spec, spacing_MHz, width_MHz, f)
-    ``contrast`` is the AFC contrast (:func:`_score_contrast`).
+        result_row = (spacing_MHz, width_MHz, quality)
+        record     = (quality, n, spec, spacing_MHz, width_MHz, f)
+    ``quality`` is the AFC comb-quality score (:func:`_score_quality`).
 
     Pass ``ctx`` (from :func:`_scan_context`) for the fast path: the transition
     table, axes, initial populations and spectrum FFT setup are reused instead of
@@ -781,7 +841,6 @@ def compute_one(item, params=None, burn=None, pump_passes=None,
     if ctx is not None:
         params, burn, df = ctx["params"], ctx["burn"], ctx["df"]
         pump_passes, target_window = ctx["pump_passes"], ctx["target_window"]
-        a_ref = ctx["a_ref"]
         freqs = comb(spacing_steps, width_steps, params)
         rho = burn(ctx["rho0"], freqs, ctx["trans_steps"], ctx["det"],
                    ctx["det0"], params, pump_passes)
@@ -789,17 +848,17 @@ def compute_one(item, params=None, burn=None, pump_passes=None,
         spec = spectrum(rho, ctx["trans"], ctx["det"], f, params,
                         ctx=ctx["sctx"])
     else:
-        a_ref = settings(params)["alpha"]
         out = run_burn(comb(spacing_steps, width_steps, params), params,
                        burn=burn, pump_passes=pump_passes)
         f, spec = out["f"], out["spec"]
 
-    contrast = _score_contrast(f, spec, target_window, a_ref)
-
     spacing_mhz = spacing_steps * df
     width_mhz = width_steps * df
-    result_row = (spacing_mhz, width_mhz, contrast)
-    record = (contrast, n, spec, spacing_mhz, width_mhz, f)
+
+    quality = _score_quality(f, spec, target_window, spacing_mhz)
+
+    result_row = (spacing_mhz, width_mhz, quality)
+    record = (quality, n, spec, spacing_mhz, width_mhz, f)
     return result_row, record
 
 
@@ -811,9 +870,9 @@ def run_scan(storage_min, storage_max, n_points,
              progress=None, log=None, estimate=None):
     """
     Sweep AFC storage time and comb finesse, scoring each spectrum by its AFC
-    contrast (A_max - A_min) / (2 * A_unburned) (:func:`_score_contrast`) over a
-    window at the centre - a rescaling of the raw delta absorption, so the best
-    point matches the delta-absorption maximum.
+    comb-quality score (:func:`_score_quality`) over a window at the centre -
+    per-period depth times tooth-height uniformity times spectral purity, so a
+    clean regular comb outranks a deep-but-messy one.
 
     The spectrum window and mesh come from ``params`` - fmin, fmax and df are
     not swept here.
@@ -832,7 +891,8 @@ def run_scan(storage_min, storage_max, n_points,
                       several teeth however wide the spacing gets.
     top_n             how many of the best spectra to keep for plotting
     parallel          run the sweep across a multiprocessing.Pool (default True)
-    n_workers         processes to use when ``parallel`` (default os.cpu_count())
+    n_workers         processes to use when ``parallel`` (default one fewer than
+                      os.cpu_count(), to leave the machine responsive)
     progress          optional callback ``progress(done, total)``; when ``None``
                       a tqdm bar is used if stdout is a TTY
     log               optional callback ``log(str)`` for the status lines;
@@ -844,8 +904,8 @@ def run_scan(storage_min, storage_max, n_points,
     Returns a dict with
         tag            short label for the run
         results        one dict per requested (storage, finesse) cell:
-                       spacing_MHz, width_MHz, finesse, storage_us, contrast
-        best           top_n dicts by contrast, each also carrying spec, f, n
+                       spacing_MHz, width_MHz, finesse, storage_us, quality
+        best           top_n dicts by quality, each also carrying spec, f, n
         params, finesse_vals, target_window, pump_passes, metric
     """
     params = DEFAULT_PARAMS if params is None else params
@@ -932,8 +992,9 @@ def run_scan(storage_min, storage_max, n_points,
     compute_one((0, uniq[len(uniq) // 2]), ctx=ctx)
     _one = time.time() - _t0
     _total = _one * len(uniq)
+    _nw = n_workers or max(1, (os.cpu_count() or 1) - 1)
     if parallel:
-        _total /= max(1, n_workers or os.cpu_count() or 1)
+        _total /= max(1, _nw)
     log("    about " + (f"{_total:.0f} seconds" if _total < 90
                         else f"{_total / 60:.0f} minutes"))
     if estimate is not None:
@@ -942,31 +1003,51 @@ def run_scan(storage_min, storage_max, n_points,
     worker = partial(compute_one, ctx=ctx)
     items = list(enumerate(uniq))
 
-    cache = {}               # (s_steps, w_steps) -> contrast
-    best = []                # heap of (contrast, n, record_dict)
+    cache = {}               # (s_steps, w_steps) -> quality
+    best = []                # heap of (quality, n, record_dict)
 
-    def _keep(contrast, n, spec, f, s_mhz, w_mhz):
+    def _keep(quality, n, spec, f, s_mhz, w_mhz):
         import heapq
-        rec = {"contrast": contrast, "n": n, "spec": spec, "f": f,
+        rec = {"quality": quality, "n": n, "spec": spec, "f": f,
                "spacing_MHz": s_mhz, "width_MHz": w_mhz,
                "finesse": s_mhz / w_mhz, "storage_us": 1.0 / s_mhz}
-        key = (contrast, n)
+        key = (quality, n)
         if len(best) < top_n:
             heapq.heappush(best, (key, rec))
         elif key > best[0][0]:
             heapq.heappushpop(best, (key, rec))
 
+    # Live solver status in the run log: a throttled line (roughly every 5 % of
+    # the sweep, or every 15 s, whichever comes first) so a long sweep is not a
+    # silent wait.
+    _sweep_t0 = time.time()
+    _log_step = max(1, len(items) // 20)
+    _log_last = [_sweep_t0]
+    log(f"[{tag}]  sweep start - {len(items)} burns"
+        + (f" across {max(1, _nw)} workers" if parallel else " (serial)"))
+
     def _consume(i, item, result_row, record):
         (s_steps, w_steps) = item[1]
-        s_mhz, w_mhz, contrast = result_row
-        cache[(s_steps, w_steps)] = contrast
-        _keep(contrast, record[1], record[2], record[5], s_mhz, w_mhz)
+        s_mhz, w_mhz, quality = result_row
+        cache[(s_steps, w_steps)] = quality
+        _keep(quality, record[1], record[2], record[5], s_mhz, w_mhz)
         if progress is not None:
             progress(i, len(items))
+        now = time.time()
+        if (i == 1 or i == len(items) or i % _log_step == 0
+                or now - _log_last[0] > 15.0):
+            _log_last[0] = now
+            el = now - _sweep_t0
+            eta = el / i * (len(items) - i)
+            t_s = 1.0 / s_mhz if s_mhz else float("nan")
+            fin = s_mhz / w_mhz if w_mhz else float("nan")
+            log(f"  scan {i}/{len(items)} ({100.0 * i / len(items):.0f}%) - "
+                f"{_fmt_dur(el)} elapsed, ~{_fmt_dur(eta)} left - "
+                f"last t_s {t_s:.3g}us F {fin:.1f} Q {quality:.2f}")
 
     if parallel:
         from multiprocessing import Pool
-        n_workers = n_workers or os.cpu_count() or 1
+        n_workers = _nw
         chunksize = max(1, len(items) // (n_workers * 4))
         with Pool(processes=n_workers) as pool:
             for i, (item, (row, rec)) in enumerate(
@@ -985,6 +1066,8 @@ def run_scan(storage_min, storage_max, n_points,
             row, rec = worker(item)
             _consume(i, item, row, rec)
 
+    log(f"[{tag}]  sweep done in {_fmt_dur(time.time() - _sweep_t0)}")
+
     # One result row per requested (storage time, finesse) cell, from the cache.
     # storage_us and finesse are the requested grid values (evenly spaced);
     # spacing_MHz / width_MHz are the mesh-snapped values actually burned.
@@ -995,7 +1078,7 @@ def run_scan(storage_min, storage_max, n_points,
             "width_MHz": w * df,
             "finesse": F,
             "storage_us": t,
-            "contrast": cache[(s, w)],
+            "quality": cache[(s, w)],
         })
 
     best_rows = [rec for _, rec in sorted(best, key=lambda t: t[0],
@@ -1008,7 +1091,7 @@ def run_scan(storage_min, storage_max, n_points,
             "finesse_vals": [float(v) for v in finesse_vals],
             "target_window": target_window,
             "pump_passes": pump_passes,
-            "metric": "afc_contrast"}
+            "metric": "afc_quality"}
 
 
 # ===========================================================================
@@ -1099,7 +1182,7 @@ def _scan_grids(scan):
 
     storage_vals   1 / tooth_spacing, in us, ascending
     finesse_vals   tooth_spacing / tooth_width, ascending
-    z              z[finesse_row, storage_col] = AFC contrast (NaN where unset)
+    z              z[finesse_row, storage_col] = AFC comb quality (NaN where unset)
     """
     res = scan["results"]
     storage_vals = np.array(sorted({r["storage_us"] for r in res}))
@@ -1108,17 +1191,17 @@ def _scan_grids(scan):
     for r in res:
         col = int(np.searchsorted(storage_vals, r["storage_us"]))
         row = int(np.searchsorted(finesse_vals, round(r["finesse"], 9)))
-        z[row, col] = r["contrast"]
+        z[row, col] = r["quality"]
     return storage_vals, finesse_vals, z
 
 
 def plot_scan_heatmap(ax, scan, *, save=None):
-    """AFC contrast over storage time (1/spacing) and finesse (spacing/width)."""
+    """AFC comb quality over storage time (1/spacing) and finesse (spacing/width)."""
     storage_vals, finesse_vals, z = _scan_grids(scan)
     mesh = ax.pcolormesh(storage_vals, finesse_vals, z, shading="nearest",
                          vmin=0.0)
-    ax.figure.colorbar(mesh, ax=ax, label="AFC contrast")
-    ax.set_title(f"AFC contrast over the central {scan['target_window']:g} MHz")
+    ax.figure.colorbar(mesh, ax=ax, label="AFC comb quality")
+    ax.set_title(f"AFC comb quality over the central {scan['target_window']:g} MHz")
     ax.set_xlabel(r"Storage time ($\mu$s)")
     ax.set_ylabel(r"Finesse  $F = \Delta / \gamma$")
     if save:
@@ -1126,28 +1209,37 @@ def plot_scan_heatmap(ax, scan, *, save=None):
     return ax
 
 
-def plot_scan_max(ax, scan, *, save=None):
-    """The best AFC contrast achievable at each storage time."""
-    best_per = {}
+def _quality_by_storage(scan):
+    """(storage_vals, q_min, q_mean, q_max, best_finesse) across all finesse."""
+    by_st = {}
     for r in scan["results"]:
-        st = r["storage_us"]
-        if st not in best_per or r["contrast"] > best_per[st][0]:
-            best_per[st] = (r["contrast"], r["finesse"])
+        by_st.setdefault(r["storage_us"], []).append((r["quality"],
+                                                      r["finesse"]))
+    storage_vals = np.array(sorted(by_st))
+    q_min = np.array([min(v[0] for v in by_st[s]) for s in storage_vals])
+    q_max = np.array([max(v[0] for v in by_st[s]) for s in storage_vals])
+    q_mean = np.array([np.mean([v[0] for v in by_st[s]]) for s in storage_vals])
+    best_fin = np.array([max(by_st[s])[1] for s in storage_vals])
+    return storage_vals, q_min, q_mean, q_max, best_fin
 
-    storage_vals = np.array(sorted(best_per))
-    max_c = np.array([best_per[s][0] for s in storage_vals])
-    best_fin = np.array([best_per[s][1] for s in storage_vals])
 
-    ax.plot(storage_vals, max_c, color="C0", lw=1.8,
-            label="best AFC contrast")
-    i = int(np.argmax(max_c))
-    ax.plot(storage_vals[i], max_c[i], linestyle="none", marker="o",
+def plot_scan_max(ax, scan, *, save=None):
+    """Best / mean / worst AFC comb quality over finesse at each storage time."""
+    storage_vals, q_min, q_mean, q_max, best_fin = _quality_by_storage(scan)
+
+    ax.fill_between(storage_vals, q_min, q_max, color="C0", alpha=0.18,
+                    label="finesse spread")
+    ax.plot(storage_vals, q_mean, color="C0", lw=1.8, label="mean")
+    ax.plot(storage_vals, q_max, color="C0", lw=1.0, ls="--", label="best")
+    ax.plot(storage_vals, q_min, color="C0", lw=1.0, ls=":", label="worst")
+    i = int(np.argmax(q_max))
+    ax.plot(storage_vals[i], q_max[i], linestyle="none", marker="o",
             markersize=11, markerfacecolor="none", markeredgecolor="C1",
             markeredgewidth=1.8,
             label=f"best: {storage_vals[i]:.3g} $\\mu$s, F {best_fin[i]:.1f}")
-    ax.set_title("Best AFC contrast at each storage time")
+    ax.set_title("AFC comb quality vs storage time (best / mean / worst)")
     ax.set_xlabel(r"Storage time ($\mu$s)")
-    ax.set_ylabel("Maximum AFC contrast")
+    ax.set_ylabel("AFC comb quality")
     ax.set_ylim(bottom=0.0)
     ax.legend(fontsize=9, loc="lower right")
     if save:
@@ -1155,22 +1247,33 @@ def plot_scan_max(ax, scan, *, save=None):
     return ax
 
 
-def plot_top_spectra(ax, scan, *, save=None):
-    """The kept top-N spectra overlaid, for visual inspection."""
+def plot_top_spectra(ax, scan, *, save=None, legend=True):
+    """
+    The kept top-N spectra overlaid, for visual inspection.
+
+    Returns ``(ax, lines, labels)`` - ``lines`` are the per-spectrum
+    ``Line2D`` handles (not the dashed unburned reference) and ``labels`` the
+    matching legend strings, so a caller can build its own legend / toggle UI.
+    Pass ``legend=False`` to skip the in-axes legend.
+    """
     p = settings(scan["params"])
     ax.axhline(p["alpha"], color="0.5", lw=0.8, ls="--")
+    lines, labels = [], []
     for r in scan["best"]:
-        ax.plot(r["f"], r["spec"], lw=0.7,
-                label=f"contrast {r['contrast']:.3f} | "
-                      f"t_s {r['storage_us']:.3g} $\\mu$s, F {r['finesse']:.1f}")
+        lab = (f"quality {r['quality']:.3f} | "
+               f"t_s {r['storage_us']:.3g} $\\mu$s, F {r['finesse']:.1f}")
+        (ln,) = ax.plot(r["f"], r["spec"], lw=0.7, label=lab)
+        lines.append(ln)
+        labels.append(lab)
     ax.set_xlabel("Frequency (MHz)")
     ax.set_ylabel("Absorption (Normalised)")
-    ax.set_title(f"Top {len(scan['best'])} spectra by AFC contrast "
+    ax.set_title(f"Top {len(scan['best'])} spectra by AFC comb quality "
                  f"({scan['tag']})")
-    ax.legend(fontsize=7, loc="upper right")
+    if legend:
+        ax.legend(fontsize=7, loc="upper right")
     if save:
         ax.figure.savefig(save)
-    return ax
+    return ax, lines, labels
 
 
 # ===========================================================================
@@ -1204,11 +1307,11 @@ def plot_scan_heatmap_plotly(scan):
     storage_vals, finesse_vals, z = _scan_grids(scan)
     fig = go.Figure(data=go.Heatmap(
         x=storage_vals, y=finesse_vals, z=z, zmin=0.0,
-        colorscale="Inferno", colorbar=dict(title="AFC contrast"),
+        colorscale="Inferno", colorbar=dict(title="AFC comb quality"),
         hovertemplate="storage %{x:.3g} us<br>finesse %{y:.1f}"
-                      "<br>contrast %{z:.3f}<extra></extra>"))
+                      "<br>quality %{z:.3f}<extra></extra>"))
     fig.update_layout(
-        title=f"AFC contrast over the central {scan['target_window']:g} MHz  "
+        title=f"AFC comb quality over the central {scan['target_window']:g} MHz  "
               f"({scan['tag']})",
         xaxis_title="Storage time (us)",
         yaxis_title="Finesse (tooth spacing / tooth width)",
@@ -1218,31 +1321,40 @@ def plot_scan_heatmap_plotly(scan):
 
 def plot_scan_max_plotly(scan):
     go = _go()
-    best_per = {}
-    for r in scan["results"]:
-        st = r["storage_us"]
-        if st not in best_per or r["contrast"] > best_per[st][0]:
-            best_per[st] = (r["contrast"], r["finesse"])
-    storage_vals = np.array(sorted(best_per))
-    max_c = np.array([best_per[s][0] for s in storage_vals])
-    best_fin = np.array([best_per[s][1] for s in storage_vals])
+    storage_vals, q_min, q_mean, q_max, best_fin = _quality_by_storage(scan)
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=storage_vals, y=max_c, mode="lines+markers",
-        line=dict(width=1.4, color="#C05621"), marker=dict(size=5),
-        name="best AFC contrast", customdata=best_fin,
-        hovertemplate="storage %{x:.3g} us<br>contrast %{y:.3f}"
-                      "<br>finesse %{customdata:.1f}<extra></extra>"))
-    i = int(np.argmax(max_c))
+        x=np.concatenate([storage_vals, storage_vals[::-1]]),
+        y=np.concatenate([q_max, q_min[::-1]]),
+        fill="toself", fillcolor="rgba(192,86,33,0.15)",
+        line=dict(width=0), name="finesse spread", hoverinfo="skip"))
     fig.add_trace(go.Scatter(
-        x=[storage_vals[i]], y=[max_c[i]], mode="markers",
+        x=storage_vals, y=q_mean, mode="lines+markers",
+        line=dict(width=1.8, color="#C05621"), marker=dict(size=4),
+        name="mean", customdata=best_fin,
+        hovertemplate="storage %{x:.3g} us<br>mean quality %{y:.3f}"
+                      "<extra></extra>"))
+    fig.add_trace(go.Scatter(
+        x=storage_vals, y=q_max, mode="lines", line=dict(width=1, dash="dash",
+        color="#C05621"), name="best",
+        hovertemplate="storage %{x:.3g} us<br>best quality %{y:.3f}"
+                      "<extra></extra>"))
+    fig.add_trace(go.Scatter(
+        x=storage_vals, y=q_min, mode="lines", line=dict(width=1, dash="dot",
+        color="#C05621"), name="worst",
+        hovertemplate="storage %{x:.3g} us<br>worst quality %{y:.3f}"
+                      "<extra></extra>"))
+    i = int(np.argmax(q_max))
+    fig.add_trace(go.Scatter(
+        x=[storage_vals[i]], y=[q_max[i]], mode="markers",
         marker=dict(size=11, color="rgba(0,0,0,0)",
                     line=dict(color="#2C7A7B", width=2)),
         name=f"best: {storage_vals[i]:.3g} us", hoverinfo="skip"))
     fig.update_layout(
-        title=f"Best AFC contrast at each storage time  ({scan['tag']})",
-        xaxis_title="Storage time (us)", yaxis_title="Maximum AFC contrast",
+        title=f"AFC comb quality vs storage time - best / mean / worst "
+              f"({scan['tag']})",
+        xaxis_title="Storage time (us)", yaxis_title="AFC comb quality",
         yaxis=dict(rangemode="tozero"), template="plotly_white")
     return fig
 
@@ -1256,10 +1368,11 @@ def plot_top_spectra_plotly(scan):
     for r in scan["best"]:
         fig.add_trace(go.Scatter(
             x=r["f"], y=r["spec"], mode="lines", line=dict(width=0.7),
-            name=f"contrast {r['contrast']:.3f} | t_s {r['storage_us']:.3g} us, "
+            name=f"quality {r['quality']:.3f} | t_s {r['storage_us']:.3g} us, "
                  f"F {r['finesse']:.1f}"))
     fig.update_layout(
-        title=f"Top {len(scan['best'])} spectra by AFC contrast ({scan['tag']})",
+        title=f"Top {len(scan['best'])} spectra by AFC comb quality "
+              f"({scan['tag']})",
         xaxis_title="Frequency (MHz)", yaxis_title="Absorption (normalised)",
         template="plotly_white")
     return fig
