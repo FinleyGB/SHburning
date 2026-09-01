@@ -77,18 +77,22 @@ Three ways to use it, mirrored by the GUI's **mode** selector:
 3. **Scan** - `run_scan(storage_min, storage_max, n_points, finesse_min,
    finesse_max, n_finesse, target_window, top_n, pump_passes, ...)` sweeps AFC
    **storage time** x comb **finesse** (`F = tooth_spacing / tooth_width`) and
-   scores each spectrum by its **AFC contrast**
-   `(A_max - A_min) / (2 * A_unburned)` over the central `target_window` - the
-   Michelson visibility of the comb with the background pinned to the unburned
-   absorption level (computed once for the sweep), so it is a strict rescaling
-   of the raw delta absorption and its maximum sits on the same `(storage,
-   finesse)` cell - keeping the top *N*. Both grids are **linear**: `n_points`
+   scores each spectrum by its **AFC comb quality** over the central
+   `target_window` - `mean_j(v_j) * uniformity * purity`, where `v_j` is the
+   robust per-tooth-period depth (5th/95th percentiles), `uniformity` penalises
+   tooth-to-tooth height scatter, and `purity` is the fraction of the windowed
+   AC power sitting in the fundamental comb period (a single-bin DFT at the known
+   tooth spacing). Each factor is in `[0, 1]`, so a comb has to be deep *and*
+   regular *and* spectrally clean to score well - a plain Michelson visibility
+   cannot separate a clean broadband comb from a deep-but-messy one. **Scores are
+   not comparable to runs made before this change.** Keeps the top *N*. Both
+   grids are **linear**: `n_points`
    storage times (µs) evenly across `[storage_min, storage_max]` and `n_finesse`
    finesse values evenly across their range, so the heatmap axes are uniformly
    spaced. Each cell keeps its requested `(storage_us, finesse)`; the burn behind
    it uses the tooth spacing `1 / t` MHz rounded to the `df` mesh (so any
    `n_points` works - nothing has to divide `df` evenly). `results` are dicts
-   `{spacing_MHz, width_MHz, finesse, storage_us, contrast}` where `spacing_MHz`
+   `{spacing_MHz, width_MHz, finesse, storage_us, quality}` where `spacing_MHz`
    is the mesh-snapped value actually burned. The tooth spacing `1/t` is
    quantised to the mesh, so two close storage times can round to the same comb.
    `run_scan` handles this itself: if the requested `n_points` cannot be resolved
@@ -150,16 +154,20 @@ from the run), then *Export…* picks the folder. Written files, for prefix `P`:
 | --- | --- | --- |
 | run log | `P_runlog.txt` | `P_runlog.txt` |
 | config | `P_config.json` (`{params, gui}`) | same |
-| figures | `P_plot.png` | `P_plot.png` + `P_heatmap.png`, `P_bestcontrast.png`, `P_topspectra.png` |
-| data | `P_spectrum.npy` (`vstack[f,spec]`), `P_spectrum.csv` | `P_results.csv` (`spacing_MHz,width_MHz,finesse,storage_us,contrast`), `P_top_spectra.npy` (row 0 = `f`, then each kept spectrum), `P_scan.pkl` |
+| figures | `P_plot.png` | `P_plot.png` + `P_heatmap.png`, `P_quality_vs_storage.png`, `P_topspectra.png` |
+| data | `P_spectrum.npy` (`vstack[f,spec]`), `P_spectrum.csv` | `P_results.csv` (`spacing_MHz,width_MHz,finesse,storage_us,quality`), `P_top_spectra.npy` (row 0 = `f`, then each kept spectrum), `P_scan.pkl` |
 
 Right column: one figure with the **pump comb** on top and the **spectrum**
 below, sharing the Frequency axis - **left-drag across it to zoom the x-axis**
 (as in the notebook's plotly plots), **double-click or the Home button to reset**,
 or use the toolbar. A scan replaces both with a single full-height view: the
-**AFC-contrast heatmap** over storage time (`1/tooth_spacing`, µs) x finesse
-(`tooth_spacing/tooth_width`), *best contrast vs storage time*, or *top spectra* -
-chosen by the *Scan view* dropdown. Below is the **Simulation run log**.
+**AFC comb-quality heatmap** over storage time (`1/tooth_spacing`, µs) x finesse
+(`tooth_spacing/tooth_width`), *quality vs storage time* (best / mean / worst over
+finesse at each storage time), or *top spectra* - chosen by the *Scan view*
+dropdown. In the top-spectra view the legend is a scrollable side panel of
+per-trace checkboxes; toggling one hides that spectrum and rescales the y-axis to
+what is left. Below is the **Simulation run log**, whose lines are timestamped and,
+during a run, carry the elapsed time and a periodic solver-status line.
 
 **Import config** reads a `P_config.json` back and restores the whole session -
 crystal preset, levels, linewidths, numerical fields, mode and its fields, the
