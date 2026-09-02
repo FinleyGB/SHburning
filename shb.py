@@ -71,7 +71,7 @@ __all__ = [
     "comb", "comb_at", "comb_in", "single_hole",
     "pulse_group", "sequence_stages", "anti_hole_pumps",
     "peak_shadow_bands", "default_pit_width",
-    "prep_gem", "prep_narrowband_afc", "PREP_PRESETS",
+    "prep_gem", "prep_narrowband_afc", "prep_broadband_afc", "PREP_PRESETS",
     "USER_PRESETS_PATH", "load_user_presets", "save_user_preset",
     "delete_user_preset",
     # scan
@@ -1102,23 +1102,58 @@ def default_pit_width(params):
     return float(gg.max() - gg.min())
 
 
-def prep_gem(params, *, centre=0.0, pit_width=None, peak_width=1.0,
-             n_burn_back=2, passes=20):
+def _shuffle_row(centre, sweep, passes, params):
+    """
+    A ``"shuffle"`` sequence-editor row: one powerful sweep, meant to erase
+    whatever feature sits at ``centre`` (a peak, a comb, an anti-hole...)
+    rather than shape one. ``sweep`` needs to clear more than the hyperfine
+    separation (36.9 MHz for the tuned Pr:YSO preset) or it leaves
+    hyperfine-shifted remnants of the old feature behind instead of erasing
+    it outright - the field is passed through as given, though, since a
+    narrower deliberate sweep is a caller's call to make, not this
+    function's to forbid.
+    """
+    p = settings(params)
+    df = p["df"]
+    c_steps = int(to_steps(centre, df))
+    sweep_steps = abs(int(to_steps(sweep, df)))
+    return {"label": "shuffle", "centre": c_steps * df,
+            "sweep": sweep_steps * df, "passes": int(passes), "on": True}
+
+
+def prep_gem(params, *, centre=0.0, pit_width=12.0, peak_width=1.0,
+             n_burn_back=1, burn_back_freq=36.9, pit_passes=100,
+             burn_back_passes=50, clean=False, clean_passes=20,
+             shuffle=False, shuffle_centre=0.0, shuffle_sweep=40.0,
+             shuffle_passes=100):
     """
     A gradient-echo-memory (GEM) preparation, as sequence-editor rows.
 
-    Three stages, burned in this order:
+    Up to four stages, burned in this order:
 
     1. **pit** - a wide sweep centred on ``centre`` that empties every ion
        class in the band, leaving a transparent window.
     2. **burn back** - single pulses outside the pit, from
        :func:`anti_hole_pumps`, that drop population back into the ground state
        absorbing at ``centre``: a narrow anti-hole in the middle of the pit.
-    3. **clean** - sweeps over the rest of the pit, either side of a
-       ``peak_width`` MHz keep-out around ``centre``, removing the broad skirts
-       the burn-back pulses leave and narrowing the peak.
+    3. **clean**, only when ``clean=True`` - sweeps over the rest of the pit,
+       either side of a ``peak_width`` MHz keep-out around ``centre``,
+       removing the broad skirts the burn-back pulses leave and narrowing the
+       peak.
+    4. **shuffle**, only when ``shuffle=True`` - one powerful sweep (see
+       :func:`_shuffle_row`) that erases whatever this sequence just burned,
+       last, once it has done its job.
 
-    ``pit_width`` defaults to :func:`default_pit_width`.
+    ``pit_width`` defaults to a fixed 12 MHz; pass ``pit_width=None`` to fall
+    back to :func:`default_pit_width` (the crystal's ground-manifold span)
+    instead.
+
+    The burn-back stays crystal-derived - it is still picked from
+    :func:`anti_hole_pumps`'s real candidates, not a hardcoded pump - but by
+    default picks the ``n_burn_back`` candidates nearest ``burn_back_freq``
+    (an MHz hint) rather than the strongest by weight. Pass
+    ``burn_back_freq=None`` to go back to picking the top-weighted
+    candidates.
     """
     p = settings(params)
     df = p["df"]
@@ -1131,31 +1166,78 @@ def prep_gem(params, *, centre=0.0, pit_width=None, peak_width=1.0,
 
     pit_lo, pit_hi = (c - half) * df, (c + half) * df
 
-    rows = [_span_row("pit", c - half, c + half, df, passes)]
+    rows = [_span_row("pit", c - half, c + half, df, pit_passes)]
+
+    candidates = anti_hole_pumps(centre, params, avoid=(pit_lo, pit_hi),
+                                 limit=None)
+    if burn_back_freq is not None:
+        candidates = sorted(candidates,
+                            key=lambda cnd: abs(cnd["freq"] - burn_back_freq))
+    candidates = candidates[:int(n_burn_back)]
 
     targets = []
-    for cand in anti_hole_pumps(centre, params, avoid=(pit_lo, pit_hi),
-                                limit=int(n_burn_back)):
+    for cand in candidates:
         rows.append({"label": "burn back", "centre": cand["freq"],
-                     "sweep": 0.0, "passes": int(passes), "on": True})
+                     "sweep": 0.0, "passes": int(burn_back_passes),
+                     "on": True})
         targets.append(cand["target"])
 
-    # The cleaning sweep fills the rest of the pit, but skips the peak *and*
-    # the other frequencies at which the peak's own ions absorb - see
-    # peak_shadow_bands. Sweeping straight over those erases the peak.
-    blocked = [(int(round(lo / df)), int(round(hi / df)))
-               for lo, hi in peak_shadow_bands(centre, params, targets,
-                                               2 * half_peak * df)]
-    if not blocked:
-        blocked = [(c - half_peak, c + half_peak)]
-    rows += _gap_rows("clean", c - half, c + half, blocked, df, passes)
+    if clean:
+        # The cleaning sweep fills the rest of the pit, but skips the peak
+        # *and* the other frequencies at which the peak's own ions absorb -
+        # see peak_shadow_bands. Sweeping straight over those erases the peak.
+        blocked = [(int(round(lo / df)), int(round(hi / df)))
+                   for lo, hi in peak_shadow_bands(centre, params, targets,
+                                                   2 * half_peak * df)]
+        if not blocked:
+            blocked = [(c - half_peak, c + half_peak)]
+        rows += _gap_rows("clean", c - half, c + half, blocked, df,
+                          clean_passes)
 
+    if shuffle:
+        rows.append(_shuffle_row(shuffle_centre, shuffle_sweep,
+                                 shuffle_passes, params))
+
+    return [r for r in rows if r is not None]
+
+
+def _comb_teeth_rows(centre, span, tooth_spacing, finesse, passes, params):
+    """
+    ``"afc comb"`` sequence-editor rows: as many whole teeth, each
+    ``tooth_spacing`` MHz apart and ``tooth_spacing / finesse`` MHz wide, as
+    fit within ``span`` MHz - laid down as one block centred on ``centre``,
+    not started from the block's low edge the way :func:`comb_at`/
+    :func:`comb_in` do, which would skew the comb toward one side of the
+    requested span instead of straddling ``centre``. All the teeth share the
+    "afc comb" label, so they burn together the way a comb burn does.
+    """
+    p = settings(params)
+    df = p["df"]
+
+    c = int(to_steps(centre, df))
+    band = max(2, int(round(float(span) / df)))
+    half = band // 2
+
+    spacing_steps = int(to_steps(tooth_spacing, df))
+    tooth_width = max(df, float(tooth_spacing) / max(1e-9, float(finesse)))
+    width_steps = max(1, int(round(tooth_width / df)))
+    span_steps = 2 * half
+    n_teeth = max(1, (span_steps - width_steps) // spacing_steps + 1)
+    footprint = (n_teeth - 1) * spacing_steps + width_steps
+    start0 = c - footprint // 2
+
+    rows = []
+    for i in range(n_teeth):
+        s0 = start0 + i * spacing_steps
+        rows.append(_span_row("afc comb", s0, s0 + width_steps - 1, df, passes))
     return [r for r in rows if r is not None]
 
 
 def prep_narrowband_afc(params, *, centre=0.0, bandwidth=4.0,
                         tooth_spacing=0.5, finesse=2.0, guard=1.0,
-                        n_burn_back=2, passes=20):
+                        n_burn_back=2, passes=20, shuffle=False,
+                        shuffle_centre=0.0, shuffle_sweep=40.0,
+                        shuffle_passes=100):
     """
     A narrowband AFC preparation, as sequence-editor rows.
 
@@ -1171,6 +1253,9 @@ def prep_narrowband_afc(params, *, centre=0.0, bandwidth=4.0,
        ``tooth_spacing / finesse`` MHz wide, placed as one block centred on
        ``centre`` and sized to fit within ``bandwidth`` MHz. All the teeth
        share one label, so they burn together the way a comb burn does.
+    4. **shuffle**, only when ``shuffle=True`` - one powerful sweep (see
+       :func:`_shuffle_row`) that erases whatever this sequence just burned,
+       last, once it has done its job.
 
     The storage time the comb gives is ``1 / tooth_spacing`` (0.5 MHz -> 2 us).
     """
@@ -1193,39 +1278,95 @@ def prep_narrowband_afc(params, *, centre=0.0, bandwidth=4.0,
                      "sweep": (2 * half_band) * df,
                      "passes": int(passes), "on": True})
 
-    # comb_in (like comb_at) always starts its teeth at the band's low edge
-    # and drops whichever tooth overhangs the high edge - fine for a comb
-    # meant to fill a window from one end, but it leaves the AFC band's own
-    # comb visibly skewed toward its low-frequency side instead of straddling
-    # centre. Placed here instead: work out how many whole teeth fit in the
-    # band, then lay that block down symmetrically around c.
-    spacing_steps = int(to_steps(tooth_spacing, df))
-    tooth_width = max(df, float(tooth_spacing) / max(1e-9, float(finesse)))
-    width_steps = max(1, int(round(tooth_width / df)))
-    span_steps = 2 * half_band
-    n_teeth = max(1, (span_steps - width_steps) // spacing_steps + 1)
-    footprint = (n_teeth - 1) * spacing_steps + width_steps
-    start0 = c - footprint // 2
-    for i in range(n_teeth):
-        s0 = start0 + i * spacing_steps
-        rows.append(_span_row("afc comb", s0, s0 + width_steps - 1, df, passes))
+    rows += _comb_teeth_rows(centre, bandwidth, tooth_spacing, finesse,
+                             passes, params)
+
+    if shuffle:
+        rows.append(_shuffle_row(shuffle_centre, shuffle_sweep,
+                                 shuffle_passes, params))
 
     return [r for r in rows if r is not None]
 
 
+def prep_broadband_afc(params, *, width=100.0, storage_time=2.0, finesse=2.0,
+                       centre=0.0, passes=20, shuffle=False,
+                       shuffle_centre=0.0, shuffle_sweep=40.0,
+                       shuffle_passes=100):
+    """
+    A broadband AFC preparation, as sequence-editor rows.
+
+    Unlike :func:`prep_narrowband_afc`, the comb is burned straight into the
+    inhomogeneous line rather than into a prepared pit: no pit, burn-back or
+    cleaning stage, just the comb itself (see :func:`_comb_teeth_rows`), and
+    an optional shuffle pulse after it.
+
+    Up to two stages, burned in this order:
+
+    1. **afc comb** - teeth ``1 / storage_time`` MHz apart (the storage time
+       an AFC of tooth spacing ``s`` gives is ``1 / s``, so this is that
+       relation used in reverse - the field that matters experimentally,
+       rather than the spacing itself), each tooth ``storage_time / finesse``
+       wide, filling ``width`` MHz centred on ``centre``.
+    2. **shuffle**, only when ``shuffle=True`` - one powerful sweep (see
+       :func:`_shuffle_row`) that erases the comb, last, once it has done
+       its job.
+
+    ``storage_time`` is free-form - unlike a pump frequency, it names no
+    position on the mesh itself, only its reciprocal (the tooth spacing)
+    does, and the reciprocal of an on-mesh spacing is essentially never
+    exactly representable in a finite decimal. So rather than gate it through
+    :func:`to_steps` (which would reject almost every value typed), the
+    implied tooth spacing is rounded to the nearest ``df`` step - the comb
+    this actually burns has ``1 / (spacing rounded to the mesh)`` for its
+    true storage time, which is what the sequence-editor row you get back
+    reflects.
+    """
+    p = settings(params)
+    df = p["df"]
+    spacing_steps = max(1, int(round(1.0 / float(storage_time) / df)))
+    tooth_spacing = spacing_steps * df
+    rows = _comb_teeth_rows(centre, width, tooth_spacing, finesse, passes,
+                            params)
+
+    if shuffle:
+        rows.append(_shuffle_row(shuffle_centre, shuffle_sweep,
+                                 shuffle_passes, params))
+
+    return rows
+
+
 #: The preparation presets offered by the GUI's sequence editor. Each entry
 #: carries its builder plus the fields the editor exposes for it, as
-#: ``(kwarg, label, default, decimals)``; a callable default is resolved
-#: against the current params, and ``decimals=0`` means an integer field.
+#: ``(kwarg, label, default, decimals)`` - or ``(..., depends_on)`` with a 5th
+#: element naming another (boolean) field this one only makes sense alongside,
+#: e.g. a shuffle pulse's width/passes next to its on/off checkbox; the GUI
+#: hides such a field until its named field is checked. A callable default is
+#: resolved against the current params, ``decimals=0`` means an integer
+#: field, and ``decimals="bool"`` means a checkbox.
+#:
+#: Every builder shares the same shuffle-pulse kwargs (``shuffle``,
+#: ``shuffle_centre``, ``shuffle_sweep``, ``shuffle_passes`` - see
+#: _shuffle_row); ``shuffle_centre`` is deliberately not exposed here, since
+#: the useful default (the sequence's own ``centre``, 0.0 for all three
+#: presets below) is what every preset already targets.
+_SHUFFLE_FIELDS = [
+    ("shuffle", "shuffle pulse after", False, "bool"),
+    ("shuffle_sweep", "shuffle width (MHz)", 40.0, 3, "shuffle"),
+    ("shuffle_passes", "shuffle passes", 100, 0, "shuffle"),
+]
+
 PREP_PRESETS = {
     "Gradient echo memory (GEM)": {
         "builder": prep_gem,
         "fields": [
             ("centre", "centre (MHz)", 0.0, 3),
-            ("pit_width", "pit width (MHz)", default_pit_width, 3),
+            ("pit_width", "pit width (MHz)", 12.0, 3),
             ("peak_width", "peak width (MHz)", 1.0, 3),
-            ("n_burn_back", "burn-back pulses", 2, 0),
-            ("passes", "pump passes per stage", 20, 0),
+            ("n_burn_back", "burn-back pulses", 1, 0),
+            ("burn_back_freq", "burn-back frequency hint (MHz)", 36.9, 3),
+            ("pit_passes", "pit passes", 100, 0),
+            ("burn_back_passes", "burn-back passes", 50, 0),
+            *_SHUFFLE_FIELDS,
         ],
     },
     "Narrowband AFC": {
@@ -1238,6 +1379,16 @@ PREP_PRESETS = {
             ("guard", "pit guard band (MHz)", 1.0, 3),
             ("n_burn_back", "burn-back pulses", 2, 0),
             ("passes", "pump passes per stage", 20, 0),
+            *_SHUFFLE_FIELDS,
+        ],
+    },
+    "Broadband AFC": {
+        "builder": prep_broadband_afc,
+        "fields": [
+            ("width", "AFC width (MHz)", 100.0, 3),
+            ("storage_time", "storage time (us)", 2.0, 3),
+            ("finesse", "finesse", 2.0, 2),
+            *_SHUFFLE_FIELDS,
         ],
     },
 }
@@ -3139,7 +3290,8 @@ def _smoke():
     # one above would scale this spectrum wrongly.
     seq_params["output_params"]["norm"] = normalisation_factor(seq_params)
 
-    rows = prep_gem(seq_params, peak_width=1.0, passes=4)
+    rows = prep_gem(seq_params, peak_width=1.0, pit_passes=4,
+                    burn_back_passes=4, clean=True, clean_passes=4)
     stages = sequence_stages(rows, seq_params)
     seq = run_sequence(stages, seq_params, burn=burn_parallel)
     centre = int(np.argmin(np.abs(seq["f"])))

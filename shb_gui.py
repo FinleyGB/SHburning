@@ -44,7 +44,7 @@ from matplotlib.backends.backend_qt import NavigationToolbar2QT  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 from matplotlib import colors as mcolors  # noqa: E402
 
-from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal  # noqa: E402
+from PyQt6.QtCore import QObject, Qt, QThread, QTimer, QUrl, pyqtSignal  # noqa: E402
 from PyQt6.QtGui import QAction  # noqa: E402
 from PyQt6.QtWidgets import (  # noqa: E402
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QFormLayout,
@@ -615,11 +615,18 @@ class PulseSequenceDialog(QDialog):
 
     COLS = ["On", "Stage", "Centre (MHz)", "Sweep (MHz)", "Passes"]
 
-    def __init__(self, rows, params, parent=None):
+    def __init__(self, rows, params, parent=None, *, initial_preset=None,
+                initial_field_values=None):
         super().__init__(parent)
         self.setWindowTitle("Edit preparation sequence")
         self.resize(720, 520)
         self._params = params
+        self._initial_preset = initial_preset
+        # {preset name: {kwarg: value}} - whatever was last typed into that
+        # preset's fields, so reopening the dialog on the same preset shows
+        # the values it was left on rather than resetting to the built-in
+        # defaults every time.
+        self._initial_field_values = initial_field_values or {}
 
         # -- presets ---------------------------------------------------
         # The combo lists the two built-in generators (GEM, Narrowband AFC),
@@ -656,6 +663,7 @@ class PulseSequenceDialog(QDialog):
 
         self._preset_form = QFormLayout()
         self._preset_fields = {}
+        self._preset_field_labels = {}
 
         # -- table -----------------------------------------------------
         self.table = QTableWidget(0, len(self.COLS))
@@ -704,7 +712,7 @@ class PulseSequenceDialog(QDialog):
         lay.addWidget(self.summary)
         lay.addWidget(buttons)
 
-        self._refresh_preset_combo(apply=False)
+        self._refresh_preset_combo(select=self._initial_preset, apply=False)
         self._set_rows(rows)
 
     # -- preset fields --------------------------------------------------
@@ -713,30 +721,81 @@ class PulseSequenceDialog(QDialog):
         while self._preset_form.rowCount():
             self._preset_form.removeRow(0)
         self._preset_fields = {}
+        self._preset_field_labels = {}
 
     def _build_preset_fields(self, name):
-        """Rebuild the preset's parameter spin boxes from its field spec."""
+        """
+        Rebuild the preset's tunable controls from its field spec.
+
+        A field tuple is normally ``(kwarg, label, default, decimals)``; a
+        5th element names another (boolean) field this one only makes sense
+        alongside - e.g. a shuffle pulse's width/passes next to its on/off
+        checkbox - and starts the row hidden unless that field is already
+        checked, toggling with it from then on.
+        """
         self._clear_preset_fields()
         spec = shb.PREP_PRESETS.get(name)
         if spec is None:
             return
         df = shb.settings(self._params)["df"]
-        for kwarg, label, default, decimals in spec["fields"]:
-            value = default(self._params) if callable(default) else default
-            if decimals == 0:
-                w = _ispin(0, 100000, int(value))
+        remembered = self._initial_field_values.get(name, {})
+        for field in spec["fields"]:
+            kwarg, label, default, decimals = field[:4]
+            depends_on = field[4] if len(field) > 4 else None
+            if kwarg in remembered:
+                value = remembered[kwarg]
             else:
-                # Step by the mesh spacing for MHz fields, so nudging the
-                # spinner mostly stays on-mesh instead of landing off it on
-                # two ticks out of three; "finesse" is the one dimensionless
-                # field among the current presets and keeps a plain decimal
-                # step.
-                step = (10.0 ** -min(decimals, 3) if kwarg == "finesse"
-                       else max(df, 1e-6))
-                w = _dspin(-100000.0, 100000.0, step, decimals, float(value))
-            w.valueChanged.connect(lambda *_: self._apply_preset(quiet=True))
-            self._preset_form.addRow(label, w)
+                value = default(self._params) if callable(default) else default
+            if decimals == "bool":
+                w = QCheckBox()
+                w.setChecked(bool(value))
+                w.toggled.connect(lambda *_: self._apply_preset(quiet=True))
+            else:
+                if decimals == 0:
+                    w = _ispin(0, 100000, int(value))
+                else:
+                    # Step by the mesh spacing for MHz fields, so nudging the
+                    # spinner mostly stays on-mesh instead of landing off it
+                    # on two ticks out of three. "finesse" (dimensionless)
+                    # and "storage_time" (microseconds, and only ever an
+                    # *approximate* mesh position once inverted to a tooth
+                    # spacing - see prep_broadband_afc) aren't MHz fields, so
+                    # a df-sized step would be the wrong unit entirely; they
+                    # keep a plain decimal step instead.
+                    step = (10.0 ** -min(decimals, 3)
+                           if kwarg in ("finesse", "storage_time")
+                           else max(df, 1e-6))
+                    w = _dspin(-100000.0, 100000.0, step, decimals,
+                              float(value))
+                w.valueChanged.connect(lambda *_: self._apply_preset(quiet=True))
+            label_w = QLabel(label)
+            self._preset_form.addRow(label_w, w)
             self._preset_fields[kwarg] = w
+            self._preset_field_labels[kwarg] = label_w
+            if depends_on:
+                gate = self._preset_fields.get(depends_on)
+                if gate is not None:
+                    self._set_field_row_visible(kwarg, gate.isChecked())
+                    gate.toggled.connect(
+                        lambda checked, k=kwarg: self._set_field_row_visible(
+                            k, checked))
+
+    def _set_field_row_visible(self, kwarg, visible):
+        """Show/hide one preset field's label and control together, e.g. a
+        shuffle pulse's width/passes appearing only once its checkbox is on."""
+        w = self._preset_fields.get(kwarg)
+        label_w = self._preset_field_labels.get(kwarg)
+        if w is not None:
+            w.setVisible(visible)
+        if label_w is not None:
+            label_w.setVisible(visible)
+
+    def current_field_values(self):
+        """The current preset's field values as builder kwargs - what
+        _apply_preset feeds the builder, and what a caller can stash away to
+        restore into a later dialog's initial_field_values."""
+        return {k: (w.isChecked() if isinstance(w, QCheckBox) else w.value())
+               for k, w in self._preset_fields.items()}
 
     def _sync_preset_fields(self, name):
         """
@@ -792,7 +851,7 @@ class PulseSequenceDialog(QDialog):
         spec = shb.PREP_PRESETS.get(name)
         if spec is None:
             return
-        kwargs = {k: w.value() for k, w in self._preset_fields.items()}
+        kwargs = self.current_field_values()
         try:
             rows = spec["builder"](self._params, **kwargs)
         except Exception as exc:                        # noqa: BLE001
@@ -1019,6 +1078,84 @@ def _ispin(lo, hi, value):
     return s
 
 
+def _dropbox_info():
+    """
+    Parsed contents of the Dropbox desktop client's own info.json - the file
+    Dropbox itself uses to know where each linked account syncs to, so this
+    follows wherever the user has it configured (or a business + personal
+    account both linked) rather than assuming ``~/Dropbox``.
+
+    Returns ``{}`` if Dropbox is not installed or the file can't be read.
+    """
+    candidates = [
+        os.path.join(os.path.expanduser("~"), ".dropbox", "info.json"),
+        os.path.join(os.environ.get("APPDATA", ""), "Dropbox", "info.json"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Dropbox", "info.json"),
+    ]
+    for info_path in candidates:
+        if not info_path or not os.path.isfile(info_path):
+            continue
+        try:
+            with open(info_path) as fh:
+                return json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            continue
+    return {}
+
+
+def _dropbox_folders():
+    """
+    Each linked Dropbox account's own synced folder (personal namespace, for
+    a business/team account - see _dropbox_info).
+
+    Returns a list of ``(label, path)`` pairs, existing directories only.
+    """
+    info = _dropbox_info()
+    found = []
+    for kind, entry in info.items():
+        path = entry.get("path") if isinstance(entry, dict) else None
+        if path and os.path.isdir(path):
+            label = f"Dropbox ({kind})" if len(info) > 1 else "Dropbox"
+            found.append((label, path))
+    return found
+
+
+# Project folders worth a one-click bookmark in every save/open dialog,
+# looked up relative to each account's Dropbox *team* root (a business
+# account's shared team folders, like this lab's, are siblings of the
+# personal namespace _dropbox_folders returns - not nested under it) rather
+# than as absolute paths, so this keeps working if the team folder ever moves
+# or is re-synced under a different account.
+_PINNED_SUBFOLDERS = [
+    "RES_EPS_Quantum_Photonics_Lab/Experiments/Current Experiments/BB Telecom QM",
+    "RES_EPS_Quantum_Photonics_Lab/Experiments/Current Experiments"
+    "/Visible Quantum Memory",
+]
+
+
+def _sidebar_folders():
+    """
+    Locations pinned into every file/folder dialog's sidebar: each linked
+    Dropbox account's own folder (see _dropbox_folders) plus the
+    _PINNED_SUBFOLDERS project folders under each account's team root.
+    Existing directories only, so a folder missing on a given machine (or a
+    personal-only Dropbox account, which has no team root) just doesn't
+    appear.
+    """
+    info = _dropbox_info()
+    folders = list(_dropbox_folders())
+    roots = {entry.get("root_path") or entry.get("path")
+             for entry in info.values() if isinstance(entry, dict)}
+    for root in roots:
+        if not root:
+            continue
+        for rel in _PINNED_SUBFOLDERS:
+            path = os.path.join(root, rel)
+            if os.path.isdir(path):
+                folders.append((os.path.basename(rel), path))
+    return folders
+
+
 # ===========================================================================
 # Main window
 # ===========================================================================
@@ -1051,6 +1188,14 @@ class MainWindow(QMainWindow):
                                         # simulation folders
 
         self._sequence_rows = []        # preparation-sequence editor rows
+        self._last_prep_preset = None   # preset shown last time the
+                                        # sequence editor was open, so
+                                        # reopening it lands on the same one
+                                        # instead of always the first built-in
+        self._last_prep_fields = {}     # {preset name: {kwarg: value}} - the
+                                        # field values it was left on, so
+                                        # reopening on the same preset shows
+                                        # them instead of resetting to defaults
 
         self._build_menu()
         self._build_body()
@@ -1226,8 +1371,8 @@ class MainWindow(QMainWindow):
         self.df.setToolTip("Mesh step. Must divide the level energies and the "
                            "window edges exactly (0.01, 0.005, 0.001 for the "
                            "default crystal).")
-        self.h_width = _dspin(0.0001, 100.0, 0.001, 4, 0.001)
-        self.h_width.setToolTip("Homogeneous FWHM (Lorentzian), MHz.")
+        self.h_width = _dspin(0.1, 100000.0, 1.0, 3, 1.0)
+        self.h_width.setToolTip("Homogeneous FWHM (Lorentzian), kHz.")
         self.in_width = _dspin(1.0, 1e6, 100.0, 1, 10000.0)
         self.in_width.setToolTip("Inhomogeneous FWHM (Gaussian), MHz.")
         self.pump_passes = _ispin(1, 100000, 10)
@@ -1243,7 +1388,7 @@ class MainWindow(QMainWindow):
         form.addRow("fmin (MHz)", self.fmin)
         form.addRow("fmax (MHz)", self.fmax)
         form.addRow("df (MHz)", self.df)
-        form.addRow("h_width (MHz)", self.h_width)
+        form.addRow("h_width (kHz)", self.h_width)
         form.addRow("in_width (MHz)", self.in_width)
         form.addRow("pump passes", self.pump_passes)
         form.addRow("burn mode", self.burn_mode)
@@ -1339,9 +1484,11 @@ class MainWindow(QMainWindow):
         # preparation sequence
         ps = QWidget()
         ps_lay = QVBoxLayout(ps)
-        ps_lay.addWidget(QLabel(
-            "A pit, burn-back and cleaning pulses - burned in order, each on\n"
-            "the populations the last one left."))
+        ps_intro = QLabel(
+            "A pit, burn-back and cleaning pulses - burned in order, each on "
+            "the populations the last one left.")
+        ps_intro.setWordWrap(True)
+        ps_lay.addWidget(ps_intro)
         edit_seq = QPushButton("Edit sequence...")
         edit_seq.clicked.connect(self._edit_sequence)
         ps_lay.addWidget(edit_seq)
@@ -1448,7 +1595,7 @@ class MainWindow(QMainWindow):
                 "dm": np.asarray(self._crystal["dm"], dtype=float),
             },
             "linewidth_params": {
-                "h_width": self.h_width.value(),
+                "h_width": self.h_width.value() / 1000.0,
                 "in_width": self.in_width.value(),
             },
             "numerical_params": {
@@ -1479,7 +1626,7 @@ class MainWindow(QMainWindow):
         self._linewidth = dict(pr["linewidth_params"])
         n = pr["numerical_params"]
         fields = {self.fmin: n["fmin"], self.fmax: n["fmax"], self.df: n["df"],
-                  self.h_width: pr["linewidth_params"]["h_width"],
+                  self.h_width: pr["linewidth_params"]["h_width"] * 1000.0,
                   self.in_width: pr["linewidth_params"]["in_width"]}
         for w, v in fields.items():
             w.blockSignals(True)
@@ -1791,6 +1938,8 @@ class MainWindow(QMainWindow):
             "h_width": self.h_width.value(),
             "in_width": self.in_width.value(),
             "sequence": [dict(r) for r in self._sequence_rows],
+            "prep_preset": self._last_prep_preset,
+            "prep_fields": self._last_prep_fields,
         }
         for name in self._GUI_FIELDS:
             gui[name] = getattr(self, name).value()
@@ -1817,7 +1966,7 @@ class MainWindow(QMainWindow):
         self.fmin.setValue(p["fmin"])
         self.fmax.setValue(p["fmax"])
         self.df.setValue(p["df"])
-        self.h_width.setValue(p["h_width"])
+        self.h_width.setValue(p["h_width"] * 1000.0)
         self.in_width.setValue(p["in_width"])
         self.pump_passes.setValue(int(p["pump_passes"]))
         self.alpha.setValue(p["alpha"])
@@ -1836,6 +1985,14 @@ class MainWindow(QMainWindow):
                 getattr(self, name).setValue(int(gui[name]))
         if isinstance(gui.get("sequence"), list):
             self._sequence_rows = [dict(r) for r in gui["sequence"]]
+        if gui.get("prep_preset"):
+            self._last_prep_preset = gui["prep_preset"]
+        if isinstance(gui.get("prep_fields"), dict):
+            self._last_prep_fields = {
+                name: dict(values)
+                for name, values in gui["prep_fields"].items()
+                if isinstance(values, dict)
+            }
         if gui.get("mode") in ("Single hole", "One comb", "Scan",
                                "Preparation sequence"):
             self.mode_combo.setCurrentText(gui["mode"])
@@ -2168,6 +2325,12 @@ class MainWindow(QMainWindow):
         if name_filter:
             dlg.setNameFilter(name_filter)
         dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        # Pin the Dropbox root(s) and a couple of project folders into the
+        # sidebar, so saving a scan there is a one-click location rather than
+        # typing/navigating to it by hand.
+        dlg.setSidebarUrls(dlg.sidebarUrls()
+                           + [QUrl.fromLocalFile(path)
+                              for _, path in _sidebar_folders()])
         dlg.resize(900, 600)
         if not dlg.exec():
             return ""
@@ -2181,13 +2344,19 @@ class MainWindow(QMainWindow):
         except Exception as exc:                        # noqa: BLE001
             self._on_error(str(exc))
             return
-        dlg = PulseSequenceDialog(self._sequence_rows, params, self)
+        dlg = PulseSequenceDialog(self._sequence_rows, params, self,
+                                  initial_preset=self._last_prep_preset,
+                                  initial_field_values=self._last_prep_fields)
         if dlg.exec():
             try:
                 self._sequence_rows = dlg.values()
             except ValueError as exc:
                 self._on_error(f"bad sequence row: {exc}")
                 return
+            self._last_prep_preset = dlg.preset_combo.currentText()
+            if dlg.preset_combo.currentText() in shb.PREP_PRESETS:
+                self._last_prep_fields[self._last_prep_preset] = \
+                    dlg.current_field_values()
             self._append_log(f"sequence updated: {len(self._sequence_rows)} rows")
             self._refresh_comb_preview()
 
