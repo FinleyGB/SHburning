@@ -61,7 +61,7 @@ if sys.platform == "win32":  # noqa: E402
 # (e.g. a conda env's own PyQt5) and PyQt6 isn't imported first, matplotlib
 # can silently pick the wrong major version and crash on mismatched Qt
 # instances.
-from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal  # noqa: E402
+from PyQt6.QtCore import QObject, Qt, QThread, QTimer, QUrl, pyqtSignal  # noqa: E402
 from PyQt6.QtGui import QAction  # noqa: E402
 from PyQt6.QtWidgets import (  # noqa: E402
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QFormLayout,
