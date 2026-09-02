@@ -12,3 +12,7 @@ __pycache__/
 # Simulation folders
 sim_*/
 runs/
+
+# Local secrets / personal config - never commit these
+.teams_webhook
+prep_presets.json

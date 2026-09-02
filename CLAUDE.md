@@ -98,6 +98,14 @@ initializer (`_init_worker`), not per task - a `functools.partial` handed to
 `(func, chunk)` per *chunk*, which is what silently multiplied the context
 across the task queue before.
 
+`run_scan` calls its optional `on_done(state, out, error)` at every terminal
+exit - the pre-flight memory refusal, the `except` clause (only when
+`_state == "failed"`, never `"cancelled"`), and right before the final
+`return out` on success. This is the one hook a scan's outcome is reported
+through (`scan_teams_notifier` builds Teams alerts from it) - if you touch
+`run_scan`'s try/except/finally structure, keep calling `on_done` at all
+three points, or a notification silently stops firing on some outcome.
+
 ## Memory rules for the scan path
 
 If you're touching `burn_parallel`, `compute_one`, or `run_scan`, keep these
@@ -186,3 +194,9 @@ There's no test suite, so lean on these:
 The repo root already carries some (an 80 MB `.pkl`, a 26 MB `.html`, PNGs) -
 `.gitignore` now excludes `*.pkl`, `*.npy`, `*.png`, `*.html`, `sim_*/`, and
 `runs/`. Don't add more; regenerate them instead.
+
+`.gitignore` also excludes two local, personal files that must never be
+committed: `.teams_webhook` (the Teams alert webhook URL - a bearer secret,
+see `resolve_teams_webhook`) and `prep_presets.json` (saved
+preparation-sequence presets, see `load_user_presets`). Neither should ever
+show up in `git status` as anything but ignored.

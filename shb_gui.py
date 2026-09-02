@@ -51,7 +51,7 @@ from PyQt6.QtWidgets import (  # noqa: E402
     QGroupBox, QComboBox, QCheckBox, QPushButton, QLabel, QLineEdit, QSpinBox,
     QDoubleSpinBox, QPlainTextEdit, QStackedWidget, QProgressBar, QFileDialog,
     QMessageBox, QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem,
-    QTabWidget, QScrollArea, QSizePolicy)
+    QTabWidget, QScrollArea, QSizePolicy, QInputDialog)
 
 import shb
 
@@ -189,7 +189,10 @@ class SimWorker(QObject):
 
             scan = shb.run_scan(params=params, progress=progress,
                                 log=self.log.emit,
-                                estimate=self.estimate.emit, **kwargs)
+                                estimate=self.estimate.emit,
+                                on_done=shb.scan_teams_notifier(
+                                    log=self.log.emit),
+                                **kwargs)
             best = scan["best"]
             if best:
                 b = best[0]
@@ -610,7 +613,7 @@ class PulseSequenceDialog(QDialog):
     own level structure; everything they produce is then editable here.
     """
 
-    COLS = ["On", "Stage", "Centre (MHz)", "Pulses", "Sweep (MHz)", "Passes"]
+    COLS = ["On", "Stage", "Centre (MHz)", "Sweep (MHz)", "Passes"]
 
     def __init__(self, rows, params, parent=None):
         super().__init__(parent)
@@ -619,21 +622,37 @@ class PulseSequenceDialog(QDialog):
         self._params = params
 
         # -- presets ---------------------------------------------------
+        # The combo lists the two built-in generators (GEM, Narrowband AFC),
+        # then a separator, then every preset saved from this table ("Save as
+        # preset..." below) - see _refresh_preset_combo, which populates it.
         self.preset_combo = QComboBox()
-        self.preset_combo.addItems(list(shb.PREP_PRESETS))
         self.preset_combo.currentTextChanged.connect(self._on_preset_changed)
         load_btn = QPushButton("Load preset")
-        load_btn.setToolTip("Rebuild the table from these settings and the "
-                            "crystal levels currently loaded. The fields "
-                            "above already apply live as you change them - "
-                            "this is for an explicit re-apply, e.g. after a "
-                            "value landed off the df mesh.")
+        load_btn.setToolTip("Reload the selected preset's rows - the fields "
+                            "above (for a built-in) already apply live as "
+                            "you change them, so this is for an explicit "
+                            "re-apply, e.g. after a value landed off the df "
+                            "mesh, or to discard hand edits since it was "
+                            "last loaded.")
         load_btn.clicked.connect(self._load_preset)
+        save_btn = QPushButton("Save as preset...")
+        save_btn.setToolTip("Save the rows currently in the table below as "
+                            "a named preset you can pick again later. Using "
+                            "the name of an existing saved preset updates "
+                            "it.")
+        save_btn.clicked.connect(self._save_as_preset)
+        self.delete_preset_btn = QPushButton("Delete preset")
+        self.delete_preset_btn.setToolTip(
+            "Remove the selected saved preset. Built-in presets (GEM, "
+            "Narrowband AFC) can't be deleted.")
+        self.delete_preset_btn.clicked.connect(self._delete_preset)
 
         top = QHBoxLayout()
         top.addWidget(QLabel("Preset"))
         top.addWidget(self.preset_combo, stretch=1)
         top.addWidget(load_btn)
+        top.addWidget(save_btn)
+        top.addWidget(self.delete_preset_btn)
 
         self._preset_form = QFormLayout()
         self._preset_fields = {}
@@ -645,7 +664,7 @@ class PulseSequenceDialog(QDialog):
 
         add_btn = QPushButton("Add row")
         add_btn.clicked.connect(lambda: self._add_row(
-            {"label": "stage", "centre": 0.0, "pulses": 1, "sweep": 0.0,
+            {"label": "stage", "centre": 0.0, "sweep": 0.0,
              "passes": 20, "on": True}))
         del_btn = QPushButton("Remove row")
         del_btn.clicked.connect(self._remove_row)
@@ -685,16 +704,19 @@ class PulseSequenceDialog(QDialog):
         lay.addWidget(self.summary)
         lay.addWidget(buttons)
 
-        self._build_preset_fields(self.preset_combo.currentText())
+        self._refresh_preset_combo(apply=False)
         self._set_rows(rows)
 
     # -- preset fields --------------------------------------------------
 
-    def _build_preset_fields(self, name):
-        """Rebuild the preset's parameter spin boxes from its field spec."""
+    def _clear_preset_fields(self):
         while self._preset_form.rowCount():
             self._preset_form.removeRow(0)
         self._preset_fields = {}
+
+    def _build_preset_fields(self, name):
+        """Rebuild the preset's parameter spin boxes from its field spec."""
+        self._clear_preset_fields()
         spec = shb.PREP_PRESETS.get(name)
         if spec is None:
             return
@@ -716,19 +738,48 @@ class PulseSequenceDialog(QDialog):
             self._preset_form.addRow(label, w)
             self._preset_fields[kwarg] = w
 
+    def _sync_preset_fields(self, name):
+        """
+        Show the right fields panel for whichever kind of preset is selected:
+        tunable fields for a built-in generator, a plain note for a saved
+        row-snapshot (it has nothing to tune - edit the rows directly).
+
+        Also updates delete_preset_btn's enabled state, since built-in
+        presets can't be deleted.
+        """
+        if name in shb.PREP_PRESETS:
+            self._build_preset_fields(name)
+        else:
+            self._clear_preset_fields()
+            if name:
+                self._preset_form.addRow(QLabel(
+                    "(saved preset - edit rows directly below)"))
+        self.delete_preset_btn.setEnabled(
+            bool(name) and name not in shb.PREP_PRESETS)
+
+    def _apply_current_preset_selection(self):
+        """Apply whatever the combo currently shows - a built-in's fields, or
+        a saved preset's row snapshot."""
+        name = self.preset_combo.currentText()
+        if name in shb.PREP_PRESETS:
+            self._apply_preset(quiet=True)
+        elif name:
+            self._load_user_preset(name)
+
     def _on_preset_changed(self, name):
-        """The combo box changed under user interaction - rebuild the fields
-        for the new preset and apply it immediately. (__init__ calls
-        _build_preset_fields directly, not through here, so opening the
-        dialog keeps showing the rows it was given rather than jumping to a
-        freshly generated preset.)"""
-        self._build_preset_fields(name)
-        self._apply_preset(quiet=True)
+        """The combo box changed under user interaction - sync the fields
+        panel for the new selection and apply it immediately. (__init__
+        populates the combo via _refresh_preset_combo(apply=False), not
+        through here, so opening the dialog keeps showing the rows it was
+        given rather than jumping to a freshly generated preset.)"""
+        self._sync_preset_fields(name)
+        self._apply_current_preset_selection()
 
     def _apply_preset(self, *, quiet):
         """
         Regenerate the table from the preset builder and the current field
-        values.
+        values. Built-in presets only - see _load_user_preset for a saved
+        row-snapshot.
 
         quiet=True (every live field edit) reports a bad combination inline,
         in the summary label - the spin-box step is aligned to df, but a
@@ -753,8 +804,85 @@ class PulseSequenceDialog(QDialog):
             return
         self._set_rows(rows)
 
+    def _load_user_preset(self, name):
+        """Load a saved preset's row snapshot (shb.load_user_presets())."""
+        rows = shb.load_user_presets().get(name)
+        if rows is not None:
+            self._set_rows(rows)
+
     def _load_preset(self):
-        self._apply_preset(quiet=False)
+        name = self.preset_combo.currentText()
+        if name in shb.PREP_PRESETS:
+            self._apply_preset(quiet=False)
+        elif name in shb.load_user_presets():
+            self._load_user_preset(name)
+
+    def _refresh_preset_combo(self, select=None, *, apply=True):
+        """
+        Rebuild preset_combo's items - the two built-ins, a separator, then
+        every saved user preset (alphabetical) - and resync the fields panel/
+        delete button for whatever ends up selected.
+
+        select picks which item to land on (default: the first). apply=False
+        skips reloading rows for that selection - used when constructing the
+        dialog, so the rows it was given are shown rather than immediately
+        overwritten by whatever preset happens to be first in the list; used
+        again after deleting a preset, so that doesn't blow away whatever is
+        currently in the table either.
+        """
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItems(list(shb.PREP_PRESETS))
+        user_names = sorted(shb.load_user_presets())
+        if user_names:
+            self.preset_combo.insertSeparator(self.preset_combo.count())
+            self.preset_combo.addItems(user_names)
+        target = select or self.preset_combo.itemText(0)
+        idx = self.preset_combo.findText(target)
+        self.preset_combo.setCurrentIndex(max(0, idx))
+        self.preset_combo.blockSignals(False)
+        self._sync_preset_fields(self.preset_combo.currentText())
+        if apply:
+            self._apply_current_preset_selection()
+
+    def _save_as_preset(self):
+        current = self.preset_combo.currentText()
+        default_name = current if current not in shb.PREP_PRESETS else ""
+        name, ok = QInputDialog.getText(self, "Save preset", "Preset name:",
+                                        text=default_name)
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if name in shb.PREP_PRESETS:
+            QMessageBox.critical(
+                self, "Save preset",
+                f'"{name}" is a built-in preset name and can\'t be '
+                f'overwritten - pick a different name.')
+            return
+        if name in shb.load_user_presets():
+            resp = QMessageBox.question(
+                self, "Save preset",
+                f'A preset named "{name}" already exists - overwrite it '
+                f'with the rows currently in the table?')
+            if resp != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            shb.save_user_preset(name, self.values())
+        except Exception as exc:                        # noqa: BLE001
+            QMessageBox.critical(self, "Save preset", str(exc))
+            return
+        self._refresh_preset_combo(select=name)
+
+    def _delete_preset(self):
+        name = self.preset_combo.currentText()
+        if name not in shb.load_user_presets():
+            return
+        resp = QMessageBox.question(
+            self, "Delete preset", f'Delete the saved preset "{name}"?')
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+        shb.delete_user_preset(name)
+        self._refresh_preset_combo(apply=False)
 
     # -- table ----------------------------------------------------------
 
@@ -779,7 +907,6 @@ class PulseSequenceDialog(QDialog):
         for c, text in enumerate((
                 str(row.get("label", "stage")),
                 f"{float(row.get('centre', 0.0)):g}",
-                f"{int(row.get('pulses', 1))}",
                 f"{float(row.get('sweep', 0.0)):g}",
                 f"{int(row.get('passes') or 0)}"), start=1):
             self.table.setItem(r, c, QTableWidgetItem(text))
@@ -862,15 +989,13 @@ class PulseSequenceDialog(QDialog):
             on_item = self.table.item(r, 0)
             try:
                 centre = float(self._cell(self.table, r, 2))
-                pulses = int(float(self._cell(self.table, r, 3)))
-                sweep = float(self._cell(self.table, r, 4))
-                passes = int(float(self._cell(self.table, r, 5)))
+                sweep = float(self._cell(self.table, r, 3))
+                passes = int(float(self._cell(self.table, r, 4)))
             except ValueError as exc:
                 raise ValueError(f"row {r + 1}: {exc}") from None
             rows.append({
                 "label": self._cell(self.table, r, 1),
                 "centre": centre,
-                "pulses": max(1, pulses),
                 "sweep": abs(sweep),
                 "passes": passes if passes > 0 else None,
                 "on": (on_item is None

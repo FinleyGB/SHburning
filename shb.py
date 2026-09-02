@@ -37,6 +37,8 @@ import sys
 import tempfile
 import time
 import traceback
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 # Single-thread BLAS and FFT. These variables bind when numpy is imported, so
@@ -70,8 +72,12 @@ __all__ = [
     "pulse_group", "sequence_stages", "anti_hole_pumps",
     "peak_shadow_bands", "default_pit_width",
     "prep_gem", "prep_narrowband_afc", "PREP_PRESETS",
+    "USER_PRESETS_PATH", "load_user_presets", "save_user_preset",
+    "delete_user_preset",
     # scan
     "compute_one", "run_scan", "QUALITY_VERSION",
+    # notifications
+    "resolve_teams_webhook", "notify_teams", "scan_teams_notifier",
     # checkpointing / simulation folders
     "load_run", "inspect_run", "collect_top", "write_run_outputs",
     # plotting (matplotlib, draw onto an Axes)
@@ -861,20 +867,17 @@ def comb_in(tooth_spacing, burn_width, lo, hi, params):
     return freqs, spacing_steps * df, width_steps * df, n_teeth
 
 
-def pulse_group(centre, n_pulses, sweep, params):
+def pulse_group(centre, sweep, params):
     """
-    A burst of ``n_pulses`` pump frequencies spread evenly over
-    ``centre +- sweep/2`` MHz.
+    Every pump frequency across ``centre +- sweep/2`` MHz, one per df step.
 
     This is the model's picture of a swept (chirped) burning pulse. The burn
     engine sees a *set of frequencies* - it carries no intensity and no pulse
-    duration - so a sweep is represented by the frequencies it visits:
-
-    - ``n_pulses=1`` (or ``sweep=0``) is one pulse at ``centre``;
-    - ``n_pulses = sweep/df + 1`` fills every mesh bin in the span, which is
-      what a pit or a cleaning sweep wants;
-    - anything between is a coarser sweep that leaves gaps, exactly as a real
-      stepped chirp would.
+    duration - so a sweep is represented by the frequencies it visits, always
+    at the crystal's own configured resolution: ``sweep=0`` is a single pulse
+    at ``centre``; otherwise every mesh bin across the span is hit. There is
+    no coarser "stepped chirp" option - a gap in the sweep is never what a
+    pit, burn-back, or cleaning stage wants.
 
     The arithmetic is done in whole df steps, so every frequency returned is on
     the mesh by construction; ``to_steps`` gates ``centre`` and ``sweep``, so an
@@ -883,22 +886,21 @@ def pulse_group(centre, n_pulses, sweep, params):
     p = settings(params)
     df = p["df"]
 
-    n = max(1, int(n_pulses))
     c = int(to_steps(centre, df))
     s = abs(int(to_steps(sweep, df)))
-    if n == 1 or s == 0:
+    if s == 0:
         return np.array([c * df])
 
-    offsets = np.round(np.linspace(-0.5 * s, 0.5 * s, n)).astype(np.int64)
-    return df * np.unique(c + offsets)
+    offsets = np.arange(s + 1) - s // 2
+    return df * (c + offsets)
 
 
 def sequence_stages(rows, params):
     """
     Turn preparation-sequence rows into the stages :func:`burn_sequence` burns.
 
-    A row is ``{"label", "centre", "pulses", "sweep", "passes", "on"}`` - one
-    swept (or single) burning pulse, as entered in the GUI's sequence editor.
+    A row is ``{"label", "centre", "sweep", "passes", "on"}`` - one swept (or
+    single) burning pulse, as entered in the GUI's sequence editor.
     **Consecutive rows sharing a label become one stage**, burned together;
     a change of label starts a new stage, burned afterwards on whatever
     populations the previous stage left. That one rule covers both cases that
@@ -918,8 +920,8 @@ def sequence_stages(rows, params):
         if not row.get("on", True):
             continue
         label = str(row.get("label", "")).strip() or "stage"
-        freqs = pulse_group(row.get("centre", 0.0), row.get("pulses", 1),
-                            row.get("sweep", 0.0), params)
+        freqs = pulse_group(row.get("centre", 0.0), row.get("sweep", 0.0),
+                            params)
         if grouped and grouped[-1]["name"] == label:
             grouped[-1]["parts"].append(freqs)
             continue
@@ -1028,8 +1030,7 @@ def _span_row(label, lo_steps, hi_steps, df, passes):
     if span % 2:
         span += 1
     return {"label": label, "centre": (lo_steps + span // 2) * df,
-            "pulses": int(span + 1), "sweep": span * df,
-            "passes": int(passes), "on": True}
+            "sweep": span * df, "passes": int(passes), "on": True}
 
 
 def peak_shadow_bands(centre, params, targets, peak_width):
@@ -1136,8 +1137,7 @@ def prep_gem(params, *, centre=0.0, pit_width=None, peak_width=1.0,
     for cand in anti_hole_pumps(centre, params, avoid=(pit_lo, pit_hi),
                                 limit=int(n_burn_back)):
         rows.append({"label": "burn back", "centre": cand["freq"],
-                     "pulses": 1, "sweep": 0.0, "passes": int(passes),
-                     "on": True})
+                     "sweep": 0.0, "passes": int(passes), "on": True})
         targets.append(cand["target"])
 
     # The cleaning sweep fills the rest of the pit, but skips the peak *and*
@@ -1190,7 +1190,6 @@ def prep_narrowband_afc(params, *, centre=0.0, bandwidth=4.0,
                                 avoid=(pit_lo_steps * df, pit_hi_steps * df),
                                 limit=int(n_burn_back)):
         rows.append({"label": "burn back", "centre": cand["freq"],
-                     "pulses": int(2 * half_band + 1),
                      "sweep": (2 * half_band) * df,
                      "passes": int(passes), "on": True})
 
@@ -1242,6 +1241,51 @@ PREP_PRESETS = {
         ],
     },
 }
+
+
+USER_PRESETS_PATH = Path(__file__).with_name("prep_presets.json")
+
+
+def load_user_presets():
+    """
+    Sequence-editor presets you have saved yourself, as ``{name: rows}``
+    (see ``PulseSequenceDialog``'s "Save as preset..." button, shb_gui.py).
+
+    Unlike :data:`PREP_PRESETS` (a formula plus adjustable fields), a saved
+    preset is a literal snapshot of rows - nothing to tune, just what was in
+    the table when it was saved. Local to this checkout (``prep_presets.json``,
+    gitignored) rather than committed, so it never enters a code review.
+
+    Returns ``{}`` if the file does not exist or cannot be parsed - a missing
+    or corrupt preset file should never stop the sequence editor from opening.
+    """
+    if not USER_PRESETS_PATH.exists():
+        return {}
+    try:
+        with open(USER_PRESETS_PATH) as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_user_preset(name, rows):
+    """Add or overwrite one saved preset - ``name`` -> a list of sequence rows."""
+    name = str(name).strip()
+    if not name:
+        raise ValueError("a preset needs a name")
+    presets = load_user_presets()
+    presets[name] = rows
+    _atomic_write_json(USER_PRESETS_PATH, presets)
+
+
+def delete_user_preset(name):
+    """Remove one saved preset, if it exists."""
+    presets = load_user_presets()
+    if name in presets:
+        del presets[name]
+        _atomic_write_json(USER_PRESETS_PATH, presets)
+
 
 # ===========================================================================
 # Scan
@@ -1610,7 +1654,7 @@ def run_scan(storage_min, storage_max, n_points,
              target_window, top_n, pump_passes,
              params=None, burn=burn_parallel,
              parallel=True, n_workers=None, maxtasksperchild=None,
-             progress=None, log=None, estimate=None,
+             progress=None, log=None, estimate=None, on_done=None,
              sim_dir=None, resume=True, checkpoint_every=10):
     """
     Sweep AFC storage time and comb finesse, scoring each spectrum by its AFC
@@ -1653,6 +1697,15 @@ def run_scan(storage_min, storage_max, n_points,
     estimate          optional callback ``estimate(seconds)`` called once with
                       the projected total run time, right after the timing
                       probe and before the sweep starts
+    on_done           optional callback ``on_done(state, out, error)``, called
+                      once the run has a terminal state - "complete" (with the
+                      full result dict as ``out``, ``error=None``) or "failed"
+                      (``out=None``, ``error`` the message/traceback text),
+                      including a pre-flight refusal that never reaches the
+                      sweep at all. Not called on "cancelled" - a Cancel is not
+                      a failure. This is the hook :func:`scan_teams_notifier`
+                      plugs into; keep calling it at every terminal exit if you
+                      touch this function's try/except/finally structure.
     sim_dir           a simulation folder to checkpoint into. ``None`` (the
                       default) reproduces the old in-memory-only behaviour
                       exactly. When set, every completed burn is appended to
@@ -1823,12 +1876,15 @@ def run_scan(storage_min, storage_max, n_points,
     if parallel and items:
         _fit = max(0, int(_budget // _per_worker))
         if _fit < 1:
-            raise ValueError(
+            _msg = (
                 f"not enough memory for even one scan worker: need "
                 f"~{_fmt_bytes(_per_worker)}/worker + "
                 f"~{_fmt_bytes(_parent_estimate)} for the parent, only "
                 f"~{_fmt_bytes(_avail)} available ({_avail_src}). Coarsen df, "
                 f"narrow fmin/fmax, or raise the minimum finesse.")
+            if on_done is not None:
+                on_done("failed", None, _msg)
+            raise ValueError(_msg)
         if _fit < _nw:
             log(f"    memory: ~{_fmt_bytes(_per_worker)}/worker "
                 f"(context {_fmt_bytes(_breakdown['context'])}, burn "
@@ -2032,6 +2088,8 @@ def run_scan(storage_min, storage_max, n_points,
         _state = "cancelled" if _cancelled[0] else "failed"
         _error = None if _cancelled[0] else "".join(
             traceback.format_exception(type(exc), exc, exc.__traceback__))
+        if on_done is not None and _state == "failed":
+            on_done("failed", None, _error)
         raise
     finally:
         results, n_missing = _build_results()
@@ -2069,7 +2127,110 @@ def run_scan(storage_min, storage_max, n_points,
             write_run_outputs(sim_dir, out)
         except Exception as exc:                       # noqa: BLE001
             log(f"    could not write final outputs to {sim_dir}: {exc}")
+    if on_done is not None:
+        on_done("complete", out, None)
     return out
+
+
+# ===========================================================================
+# Notifications - optional webhook alert when a scan finishes or fails
+# ===========================================================================
+
+def resolve_teams_webhook():
+    """
+    The configured Teams (Power Automate) webhook URL, or None if none is set.
+
+    Checked in order: the ``SHB_TEAMS_WEBHOOK`` environment variable, then a
+    ``.teams_webhook`` file next to this module (one line, the URL). Neither
+    is required; with neither set, :func:`notify_teams` is a silent no-op.
+
+    The webhook URL is a bearer secret - anyone holding it can post to the
+    channel - so ``.teams_webhook`` is gitignored and must never be committed;
+    the environment variable lets it be overridden per-machine without
+    touching that file at all.
+    """
+    url = os.environ.get("SHB_TEAMS_WEBHOOK")
+    if url:
+        return url.strip()
+    path = Path(__file__).with_name(".teams_webhook")
+    if path.exists():
+        text = path.read_text().strip()
+        return text or None
+    return None
+
+
+def notify_teams(title, text, *, webhook_url=None, log=None):
+    """
+    Best-effort POST of a simple Teams "MessageCard" to a Power Automate
+    webhook.
+
+    Never raises - a notification failure must not take down or mask the
+    result of an actual scan. A problem is reported to ``log`` if given,
+    otherwise printed to stderr, and otherwise dropped.
+
+    ``webhook_url`` defaults to :func:`resolve_teams_webhook`; with neither
+    that nor the environment/file configured, this is a silent no-op (no
+    network attempt at all).
+    """
+    if webhook_url is None:
+        webhook_url = resolve_teams_webhook()
+    if not webhook_url:
+        return
+    payload = json.dumps({
+        "@type": "MessageCard",
+        "@context": "http://schema.org/extensions",
+        "summary": title,
+        "title": title,
+        "text": text,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        webhook_url, data=payload, headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        msg = f"Teams notification failed: {exc}"
+        if log is not None:
+            log(msg)
+        else:
+            print(msg, file=sys.stderr)
+
+
+def scan_teams_notifier(webhook_url=None, log=None):
+    """
+    An ``on_done`` callback for :func:`run_scan` that posts a finish/fail
+    summary to Teams - pass as ``run_scan(..., on_done=scan_teams_notifier())``.
+
+    The webhook is resolved once, here, rather than on every call: with
+    nothing configured this returns ``None`` (not a callable), so a caller
+    can pass the result straight through and ``run_scan``'s ``on_done is not
+    None`` check disables the hook for free - no wasted HTTP attempt on the
+    common case of nobody having set this up.
+
+    Only "complete" and "failed" post a message; "cancelled" (the caller
+    simply never invokes this for that state - see run_scan's on_done
+    parameter) is a user's own choice, not a failure worth an alert.
+    """
+    if webhook_url is None:
+        webhook_url = resolve_teams_webhook()
+    if not webhook_url:
+        return None
+
+    def on_done(state, out, error):
+        if state == "complete":
+            best = out["best"][0] if out["best"] else None
+            summary = (
+                f"quality {best['quality']:.3f} at t_s {best['storage_us']:.3g}"
+                f" us, F {best['finesse']:.1f}" if best else "no spectra kept")
+            notify_teams(
+                f"Scan finished: {out['tag']}",
+                f"{out['n_done']}/{out['n_total']} burns done. Best: {summary}.",
+                webhook_url=webhook_url, log=log)
+        elif state == "failed":
+            notify_teams(
+                "Scan failed",
+                error or "(no error message captured)",
+                webhook_url=webhook_url, log=log)
+    return on_done
 
 
 # ===========================================================================
@@ -3025,7 +3186,8 @@ def _cli_scan(args):
         args.target_window, args.top_n, pump_passes,
         params=params, burn=burn, parallel=not args.serial,
         n_workers=args.workers, sim_dir=args.sim_dir, resume=args.resume,
-        checkpoint_every=args.checkpoint_every)
+        checkpoint_every=args.checkpoint_every,
+        on_done=_shb.scan_teams_notifier())
     print(f"[{scan['tag']}] {scan['state']}: {scan['n_done']}/{scan['n_total']} "
          f"burns, {len(scan['results'])} results, {len(scan['best'])} kept "
          f"-> {args.sim_dir}")

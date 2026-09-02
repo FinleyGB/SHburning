@@ -129,17 +129,17 @@ A sequence is built from **rows**, one per burning pulse:
 | --- | --- |
 | `label` | the stage this row belongs to |
 | `centre` | centre frequency (MHz), on the `df` mesh |
-| `pulses` | how many pump frequencies the row fires |
-| `sweep` | the frequency span they are spread over (MHz) |
+| `sweep` | the frequency span the row's pulse is spread over (MHz) |
 | `passes` | pump passes for this stage (blank = the configured `pump_passes`) |
 | `on` | untick to keep a row without burning it |
 
-`shb.pulse_group(centre, pulses, sweep, params)` expands a row: `pulses=1` is a
-single pulse at `centre`, `pulses = sweep/df + 1` fills every mesh bin in the
-span (a pit or a cleaning sweep), anything between is a coarser stepped chirp.
-**Consecutive rows sharing a label form one stage**, burned together - so the
-teeth of a comb (many rows, one label) go in at once as a comb burn does, while
-a pit and its burn-back (different labels) stay strictly ordered.
+`shb.pulse_group(centre, sweep, params)` expands a row: `sweep=0` is a single
+pulse at `centre`, otherwise every mesh bin across the span is hit - always at
+the crystal's own `df` resolution, so there is no separate "how many pulses"
+knob to set. **Consecutive rows sharing a label form one stage**, burned
+together - so the teeth of a comb (many rows, one label) go in at once as a
+comb burn does, while a pit and its burn-back (different labels) stay
+strictly ordered.
 `shb.sequence_stages(rows, params)` does the grouping;
 `shb.run_sequence(stages, params)` burns them and returns exactly what
 `run_burn` returns, plus `stages`.
@@ -197,6 +197,29 @@ A long scan does not need the GUI open: `python shb.py scan --sim-dir ... `
 runs headless, `--resume` (the default) continues an interrupted one, and
 `python shb.py status --sim-dir ...` / `collect --sim-dir ...` check on or
 finish a run from the checkpoint. See `python shb.py scan --help`.
+
+### Teams notifications
+
+A scan that finishes or fails can post to a Microsoft Teams channel via a
+Power Automate webhook - useful for exactly the unattended, headless scans
+above. Set the webhook URL either as the `SHB_TEAMS_WEBHOOK` environment
+variable, or in a `.teams_webhook` file (one line, the URL) next to `shb.py` -
+both are checked by `shb.resolve_teams_webhook()`, env var first. Neither is
+required; with nothing configured, notifications are a silent no-op.
+
+**The webhook URL is a bearer secret** - anyone holding it can post to your
+channel - so `.teams_webhook` is gitignored and must never be committed.
+
+Once configured, every scan (GUI or `python shb.py scan`) posts automatically:
+one message when it completes (`state == "complete"`, with the best kept
+spectrum's quality/storage-time/finesse if any were kept), one when it
+genuinely fails (`state == "failed"`, including the pre-flight
+not-enough-memory refusal). A user-initiated `Cancel` never posts - that is a
+choice, not a failure. A notification failure (webhook unreachable, etc.) is
+logged and otherwise ignored; it never affects the scan itself.
+`shb.notify_teams(title, text)` and `shb.scan_teams_notifier()` (an
+`on_done` callback for `run_scan`) are the two building blocks, if you want to
+wire this into another script.
 
 ### The `df` rule
 
