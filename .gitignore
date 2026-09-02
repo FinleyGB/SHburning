@@ -1,0 +1,14 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Generated artefacts - regenerate them, don't commit them (see CLAUDE.md)
+*.pkl
+*.npy
+*.png
+*.html
+
+# Simulation folders
+sim_*/
+runs/
