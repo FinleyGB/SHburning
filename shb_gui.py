@@ -44,7 +44,7 @@ from matplotlib.backends.backend_qt import NavigationToolbar2QT  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 from matplotlib import colors as mcolors  # noqa: E402
 
-from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal  # noqa: E402
+from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal  # noqa: E402
 from PyQt6.QtGui import QAction  # noqa: E402
 from PyQt6.QtWidgets import (  # noqa: E402
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QFormLayout,
@@ -124,6 +124,44 @@ class SimWorker(QObject):
             self.log.emit(f"burning {n_pf} pump frequencies...")
             out = shb.run_burn(pump_freqs, params, burn=burn,
                                pump_passes=pump_passes)
+            self.log.emit("spectrum done")
+            spec = out["spec"]
+            p = shb.settings(params)
+            self.log.emit(
+                f"Absorption {spec.min():.2f} to {spec.max():.2f}  "
+                f"(dAbsorption {spec.max() - spec.min():.2f}, "
+                f"unburned {p['alpha']:.2f})")
+            self.burn_done.emit(out)
+        except Exception as exc:                       # noqa: BLE001
+            self.error.emit(str(exc))
+        finally:
+            self.progress.emit(1, 1)
+            self.busy.emit(False)
+
+    def run_sequence_job(self, params, rows, burn_name, summary):
+        """
+        A preparation sequence: the rows become stages, and the stages are
+        burned in order (shb.run_sequence). The result dict is the same shape
+        run_burn returns - plus its stages - so it comes back on the existing
+        burn_done signal and every plot / export path downstream is unchanged.
+        """
+        self._cancel = False
+        self.busy.emit(True)
+        self.progress.emit(0, 0)
+        try:
+            shb.validate_params(params)
+            if params["output_params"].get("norm") is None:
+                self.log.emit("computing normalisation factor...")
+                params["output_params"]["norm"] = shb.normalisation_factor(params)
+                self.norm_ready.emit(params["output_params"]["norm"])
+                self.log.emit(
+                    f"normalisation factor: {params['output_params']['norm']:.6f}")
+
+            burn = shb.burn_series if burn_name == "series" else shb.burn_parallel
+            stages = shb.sequence_stages(rows, params)
+            self.log.emit(summary)
+            out = shb.run_sequence(stages, params, burn=burn,
+                                   log=self.log.emit)
             self.log.emit("spectrum done")
             spec = out["spec"]
             p = shb.settings(params)
@@ -337,11 +375,12 @@ class StackedPlot(QWidget):
 
     # -- drawing --------------------------------------------------------
 
-    def _stacked_axes(self):
+    def _stacked_axes(self, top_ratio=1.0):
         self._clear_legend_panel()
         self._legend_panel.hide()
         self.figure.clear()
-        gs = self.figure.add_gridspec(2, 1, height_ratios=[1, 3], hspace=0.08)
+        gs = self.figure.add_gridspec(2, 1, height_ratios=[top_ratio, 3],
+                                      hspace=0.08)
         ax_top = self.figure.add_subplot(gs[0])
         ax_bot = self.figure.add_subplot(gs[1], sharex=ax_top)
         ax_top.tick_params(labelbottom=False)
@@ -368,9 +407,25 @@ class StackedPlot(QWidget):
             button=1, drag_from_anywhere=True,
             props=dict(alpha=0.15, facecolor="0.5"))
 
-    def show_preview(self, pump_freqs, params):
-        ax_top, ax_bot = self._stacked_axes()
-        shb.plot_comb(ax_top, pump_freqs, params, show_xlabel=False)
+    @staticmethod
+    def _draw_pulses(ax, pump_freqs, params, stages):
+        """
+        The top panel: one band per stage for a preparation sequence, the plain
+        pump mask for a single hole or comb.
+        """
+        if stages:
+            shb.plot_sequence(ax, stages, params, show_xlabel=False)
+        else:
+            shb.plot_comb(ax, pump_freqs, params, show_xlabel=False)
+
+    @staticmethod
+    def _top_ratio(stages):
+        """A taller top panel when a sequence has several stages to stack."""
+        return 1.0 if not stages else min(3.0, 0.5 + 0.35 * len(stages))
+
+    def show_preview(self, pump_freqs, params, stages=None):
+        ax_top, ax_bot = self._stacked_axes(self._top_ratio(stages))
+        self._draw_pulses(ax_top, pump_freqs, params, stages)
         ax_bot.text(0.5, 0.5, "run to see the spectrum", ha="center",
                     va="center", color="0.5", transform=ax_bot.transAxes)
         ax_bot.set_xlabel("Frequency (MHz)")
@@ -380,8 +435,8 @@ class StackedPlot(QWidget):
         self._finish()
 
     def show_burn(self, pump_freqs, params, out):
-        ax_top, ax_bot = self._stacked_axes()
-        shb.plot_comb(ax_top, pump_freqs, params, show_xlabel=False)
+        ax_top, ax_bot = self._stacked_axes(self._top_ratio(out.get("stages")))
+        self._draw_pulses(ax_top, pump_freqs, params, out.get("stages"))
         shb.plot_spectrum(ax_bot, out["f"], out["spec"], params)
         p = shb.settings(params)
         ax_top.set_xlim(p["fmin"], p["fmax"])
@@ -502,6 +557,252 @@ class LevelsDialog(QDialog):
         return {"g": g, "e": e, "dm": dm}
 
 
+class PulseSequenceDialog(QDialog):
+    """
+    The preparation-sequence editor: rows of burning pulses, burned in order.
+
+    Each row is one pulse, or one swept pulse - a centre frequency, how many
+    pulses it fires, and the frequency sweep they are spread over (see
+    ``shb.pulse_group``). **Consecutive rows sharing a stage name burn
+    together**; a change of name starts a new stage, burned afterwards on the
+    populations the previous stage left. That is what lets a pit, its
+    burn-back and the cleaning sweeps be one sequence rather than one
+    indiscriminate burn, while the many teeth of a comb still go in at once.
+
+    The presets (``shb.PREP_PRESETS``) fill the table from the loaded crystal's
+    own level structure; everything they produce is then editable here.
+    """
+
+    COLS = ["On", "Stage", "Centre (MHz)", "Pulses", "Sweep (MHz)", "Passes"]
+
+    def __init__(self, rows, params, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit preparation sequence")
+        self.resize(720, 520)
+        self._params = params
+
+        # -- presets ---------------------------------------------------
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems(list(shb.PREP_PRESETS))
+        self.preset_combo.currentTextChanged.connect(self._build_preset_fields)
+        load_btn = QPushButton("Load preset")
+        load_btn.setToolTip("Replace the table with this preparation, rebuilt "
+                            "from the crystal levels currently loaded.")
+        load_btn.clicked.connect(self._load_preset)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Preset"))
+        top.addWidget(self.preset_combo, stretch=1)
+        top.addWidget(load_btn)
+
+        self._preset_form = QFormLayout()
+        self._preset_fields = {}
+
+        # -- table -----------------------------------------------------
+        self.table = QTableWidget(0, len(self.COLS))
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        self.table.itemChanged.connect(self._on_edited)
+
+        add_btn = QPushButton("Add row")
+        add_btn.clicked.connect(lambda: self._add_row(
+            {"label": "stage", "centre": 0.0, "pulses": 1, "sweep": 0.0,
+             "passes": 20, "on": True}))
+        del_btn = QPushButton("Remove row")
+        del_btn.clicked.connect(self._remove_row)
+        up_btn = QPushButton("Move up")
+        up_btn.clicked.connect(lambda: self._move_row(-1))
+        down_btn = QPushButton("Move down")
+        down_btn.clicked.connect(lambda: self._move_row(+1))
+        for b in (up_btn, down_btn):
+            b.setToolTip("Stages burn in table order, and the order is "
+                         "physics: burn back before the pit and there is "
+                         "nothing to burn back into.")
+
+        btn_row = QHBoxLayout()
+        for b in (add_btn, del_btn, up_btn, down_btn):
+            btn_row.addWidget(b)
+        btn_row.addStretch(1)
+
+        self.summary = QLabel("-")
+        self.summary.setWordWrap(True)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        lay = QVBoxLayout(self)
+        lay.addLayout(top)
+        lay.addLayout(self._preset_form)
+        hint = QLabel(
+            "Rows burn top to bottom, and rows sharing a stage name burn "
+            "together. Passes 0 uses the pump passes set on the main window.")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        lay.addWidget(self.table, stretch=1)
+        lay.addLayout(btn_row)
+        lay.addWidget(self.summary)
+        lay.addWidget(buttons)
+
+        self._build_preset_fields(self.preset_combo.currentText())
+        self._set_rows(rows)
+
+    # -- preset fields --------------------------------------------------
+
+    def _build_preset_fields(self, name):
+        """Rebuild the preset's parameter spin boxes from its field spec."""
+        while self._preset_form.rowCount():
+            self._preset_form.removeRow(0)
+        self._preset_fields = {}
+        spec = shb.PREP_PRESETS.get(name)
+        if spec is None:
+            return
+        for kwarg, label, default, decimals in spec["fields"]:
+            value = default(self._params) if callable(default) else default
+            if decimals == 0:
+                w = _ispin(0, 100000, int(value))
+            else:
+                w = _dspin(-100000.0, 100000.0, 10.0 ** -min(decimals, 3),
+                           decimals, float(value))
+            self._preset_form.addRow(label, w)
+            self._preset_fields[kwarg] = w
+
+    def _load_preset(self):
+        name = self.preset_combo.currentText()
+        spec = shb.PREP_PRESETS.get(name)
+        if spec is None:
+            return
+        kwargs = {k: w.value() for k, w in self._preset_fields.items()}
+        try:
+            rows = spec["builder"](self._params, **kwargs)
+        except Exception as exc:                        # noqa: BLE001
+            QMessageBox.critical(self, "Preset", str(exc))
+            return
+        self._set_rows(rows)
+
+    # -- table ----------------------------------------------------------
+
+    def _set_rows(self, rows):
+        self.table.blockSignals(True)
+        self.table.setRowCount(0)
+        for row in rows:
+            self._add_row(row, quiet=True)
+        self.table.blockSignals(False)
+        self.table.resizeColumnsToContents()
+        self._on_edited()
+
+    def _add_row(self, row, quiet=False):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+
+        on = QTableWidgetItem()
+        on.setFlags(on.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        on.setCheckState(Qt.CheckState.Checked if row.get("on", True)
+                         else Qt.CheckState.Unchecked)
+        self.table.setItem(r, 0, on)
+        for c, text in enumerate((
+                str(row.get("label", "stage")),
+                f"{float(row.get('centre', 0.0)):g}",
+                f"{int(row.get('pulses', 1))}",
+                f"{float(row.get('sweep', 0.0)):g}",
+                f"{int(row.get('passes') or 0)}"), start=1):
+            self.table.setItem(r, c, QTableWidgetItem(text))
+        if not quiet:
+            self._on_edited()
+
+    def _remove_row(self):
+        r = self.table.currentRow()
+        if r >= 0:
+            self.table.removeRow(r)
+            self._on_edited()
+
+    def _move_row(self, delta):
+        r = self.table.currentRow()
+        t = r + delta
+        if r < 0 or not (0 <= t < self.table.rowCount()):
+            return
+        self.table.blockSignals(True)
+        taken = [self.table.takeItem(r, c) for c in range(len(self.COLS))]
+        self.table.removeRow(r)
+        self.table.insertRow(t)
+        for c, item in enumerate(taken):
+            self.table.setItem(t, c, item)
+        self.table.blockSignals(False)
+        self.table.setCurrentCell(t, 1)
+        self._on_edited()
+
+    def _tint_groups(self):
+        """Shade alternate stages, so the row grouping is visible."""
+        from PyQt6.QtGui import QBrush, QColor
+        shades = (QColor(0, 0, 0, 0), QColor(0, 0, 0, 18))
+        last, band = None, 0
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 1)
+            label = item.text().strip() if item is not None else ""
+            if last is not None and label != last:
+                band ^= 1
+            last = label
+            for c in range(len(self.COLS)):
+                cell = self.table.item(r, c)
+                if cell is not None:
+                    cell.setBackground(QBrush(shades[band]))
+
+    def _on_edited(self, *_):
+        self.table.blockSignals(True)
+        self._tint_groups()
+        self.table.blockSignals(False)
+        try:
+            stages = shb.sequence_stages(self.values(), self._params)
+        except ValueError as exc:
+            self.summary.setText(f"! {exc}")
+            self.summary.setStyleSheet("color: #a00;")
+            return
+        # Per-stage counts are summed, not deduped: a cleaning sweep
+        # deliberately revisits frequencies the pit already burned, and both
+        # burns are real work.
+        n = sum(int(st["freqs"].size) for st in stages)
+        distinct = len(np.unique(np.concatenate(
+            [st["freqs"] for st in stages]))) if stages else 0
+        names = ", ".join(st["name"] for st in stages) or "nothing enabled"
+        self.summary.setText(
+            f"{len(stages)} stage(s) in burn order: {names} - "
+            f"{n} pulses over {distinct} distinct frequencies")
+        self.summary.setStyleSheet("color: grey;")
+
+    # -- read back ------------------------------------------------------
+
+    @staticmethod
+    def _cell(table, r, c):
+        item = table.item(r, c)
+        if item is None or not item.text().strip():
+            raise ValueError(f"empty cell at row {r + 1}, "
+                             f"{PulseSequenceDialog.COLS[c]}")
+        return item.text().strip()
+
+    def values(self):
+        """The rows, as the plain dicts shb.sequence_stages consumes."""
+        rows = []
+        for r in range(self.table.rowCount()):
+            on_item = self.table.item(r, 0)
+            try:
+                centre = float(self._cell(self.table, r, 2))
+                pulses = int(float(self._cell(self.table, r, 3)))
+                sweep = float(self._cell(self.table, r, 4))
+                passes = int(float(self._cell(self.table, r, 5)))
+            except ValueError as exc:
+                raise ValueError(f"row {r + 1}: {exc}") from None
+            rows.append({
+                "label": self._cell(self.table, r, 1),
+                "centre": centre,
+                "pulses": max(1, pulses),
+                "sweep": abs(sweep),
+                "passes": passes if passes > 0 else None,
+                "on": (on_item is None
+                       or on_item.checkState() == Qt.CheckState.Checked),
+            })
+        return rows
+
 def _dspin(lo, hi, step, decimals, value):
     s = QDoubleSpinBox()
     s.setRange(lo, hi)
@@ -526,6 +827,7 @@ class MainWindow(QMainWindow):
 
     request_norm = pyqtSignal(dict)
     request_burn = pyqtSignal(dict, object, str, int, str)
+    request_sequence = pyqtSignal(dict, object, str, str)
     request_scan = pyqtSignal(dict, dict)
 
     def __init__(self):
@@ -548,9 +850,21 @@ class MainWindow(QMainWindow):
         self._sim_root = None           # remembered parent for auto-named
                                         # simulation folders
 
+        self._sequence_rows = []        # preparation-sequence editor rows
+
         self._build_menu()
         self._build_body()
         self._build_worker()
+
+        # A GEM preparation to start from, derived from the loaded crystal.
+        # Best effort: a preset whose defaults do not fit the current window
+        # must not stop the window opening.
+        try:
+            self._sequence_rows = shb.prep_gem(self._collect_params())
+        except Exception as exc:                        # noqa: BLE001
+            self._sequence_rows = []
+            print(f"could not build the default sequence: {exc}",
+                  file=sys.stderr)
 
         self._norm_timer = QTimer(self)
         self._norm_timer.setSingleShot(True)
@@ -610,9 +924,10 @@ class MainWindow(QMainWindow):
         sim_lay.addWidget(self._build_sim_group(), stretch=1)
 
         self.left_tabs = QTabWidget()
-        self.left_tabs.addTab(sim_tab, "Simulation")
-        self.left_tabs.addTab(self._build_export_tab(), "Export")
-        self.left_tabs.setFixedWidth(360)
+        self.left_tabs.addTab(self._scrollable(sim_tab), "Simulation")
+        self.left_tabs.addTab(self._scrollable(self._build_export_tab()),
+                              "Export")
+        self.left_tabs.setFixedWidth(380)
         root.addWidget(self.left_tabs)
 
         # ---- right column ---------------------------------------------
@@ -657,6 +972,25 @@ class MainWindow(QMainWindow):
         right.addWidget(lw, stretch=2)
 
         root.addLayout(right, stretch=1)
+
+    @staticmethod
+    def _scrollable(widget):
+        """
+        Put a tab's controls in a scroll area.
+
+        The left column is a fixed width and the Scan and Preparation-sequence
+        pages are tall; on a short window the Run button and the progress bar
+        used to be simply unreachable. Scrolling vertically (never
+        horizontally - the column is already as wide as it gets) keeps every
+        control reachable.
+        """
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        area.setFrameShape(QScrollArea.Shape.NoFrame)
+        area.setWidget(widget)
+        return area
 
     def _build_crystal_group(self):
         box = QGroupBox("Crystal parameters")
@@ -716,7 +1050,8 @@ class MainWindow(QMainWindow):
         form.addRow("alpha", self.alpha)
 
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Single hole", "One comb", "Scan"])
+        self.mode_combo.addItems(["Single hole", "One comb", "Scan",
+                                  "Preparation sequence"])
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         form.addRow("mode", self.mode_combo)
         outer.addLayout(form)
@@ -801,6 +1136,22 @@ class MainWindow(QMainWindow):
         sc_form.addRow(self.sim_dir_info)
         self.stack.addWidget(sc)
 
+        # preparation sequence
+        ps = QWidget()
+        ps_lay = QVBoxLayout(ps)
+        ps_lay.addWidget(QLabel(
+            "A pit, burn-back and cleaning pulses - burned in order, each on\n"
+            "the populations the last one left."))
+        edit_seq = QPushButton("Edit sequence...")
+        edit_seq.clicked.connect(self._edit_sequence)
+        ps_lay.addWidget(edit_seq)
+        self.seq_info = QLabel("-")
+        self.seq_info.setWordWrap(True)
+        self.seq_info.setStyleSheet("color: grey;")
+        ps_lay.addWidget(self.seq_info)
+        ps_lay.addStretch(1)
+        self.stack.addWidget(ps)
+
         outer.addWidget(self.stack)
 
         self.run_btn = QPushButton("Run")
@@ -858,6 +1209,7 @@ class MainWindow(QMainWindow):
 
         self.request_norm.connect(self.worker.compute_norm)
         self.request_burn.connect(self.worker.run_burn_job)
+        self.request_sequence.connect(self.worker.run_sequence_job)
         self.request_scan.connect(self.worker.run_scan_job)
 
         self.worker.log.connect(self._append_log)
@@ -953,16 +1305,35 @@ class MainWindow(QMainWindow):
             self._refresh_sim_dir_state()
 
     def _current_pump_freqs(self, params):
+        """
+        The pump frequencies the current mode would burn.
+
+        Returns ``(freqs, summary, stages)``. ``stages`` is None for the modes
+        that burn one flat set of frequencies, and the ordered stage list for a
+        preparation sequence - which is what the top panel needs to draw the
+        stages separately, and what tells the run path which worker job to use.
+        """
         mode = self.mode_combo.currentIndex()
         if mode == 0:
-            return shb.single_hole(self.centre.value()), "single hole"
+            return shb.single_hole(self.centre.value()), "single hole", None
         if mode == 1:
             freqs, sp, wd, nt = shb.comb_at(
                 self.tooth_spacing.value(), self.burn_width.value(), params)
             self.comb_info.setText(
                 f"spacing {sp:g} MHz, width {wd:g} MHz "
                 f"({wd / sp:.0%}), {nt} teeth")
-            return freqs, f"comb: {sp:g} MHz spacing, {wd:g} MHz width, {nt} teeth"
+            return (freqs,
+                    f"comb: {sp:g} MHz spacing, {wd:g} MHz width, {nt} teeth",
+                    None)
+        if mode == 3:
+            stages = shb.sequence_stages(self._sequence_rows, params)
+            freqs = (np.unique(np.concatenate([st["freqs"] for st in stages]))
+                     if stages else np.array([]))
+            names = ", ".join(st["name"] for st in stages) or "empty"
+            summary = (f"sequence: {len(stages)} stages ({names}), "
+                       f"{freqs.size} pump frequencies")
+            self.seq_info.setText(summary)
+            return freqs, summary, stages
         # scan preview: comb at the middle of the storage-time / finesse grid
         t_mid = 0.5 * (self.storage_min.value() + self.storage_max.value())
         mid = 1.0 / max(t_mid, 1e-9)                 # tooth spacing, MHz
@@ -973,18 +1344,18 @@ class MainWindow(QMainWindow):
         width = max(df, round((mid / f_mid) / df) * df)
         freqs, sp, wd, nt = shb.comb_at(mid, width, params)
         return freqs, (f"scan preview: t_s {1 / sp:.3g} us, comb at "
-                       f"{sp:g} MHz, F {sp / wd:.1f}")
+                       f"{sp:g} MHz, F {sp / wd:.1f}"), None
 
     def _refresh_comb_preview(self, *_):
         """Live pump-comb preview; the plot returns to preview when inputs change."""
         try:
             params = self._collect_params()
             shb.validate_params(params)
-            freqs, _ = self._current_pump_freqs(params)
+            freqs, _, stages = self._current_pump_freqs(params)
         except Exception as exc:                       # noqa: BLE001
             self.plot.show_message(str(exc))
             return
-        self.plot.show_preview(freqs, params)
+        self.plot.show_preview(freqs, params, stages)
 
     # -- run ----------------------------------------------------------
 
@@ -1056,12 +1427,18 @@ class MainWindow(QMainWindow):
             self._write_sim_dir_config(sim_dir, params)
             self.request_scan.emit(params, kwargs)
         else:
-            freqs, summary = self._current_pump_freqs(params)
+            freqs, summary, stages = self._current_pump_freqs(params)
             self._job_kind = "burn"
-            self._append_log("--- burn ---")
-            self.request_burn.emit(params, np.asarray(freqs),
-                                   self.burn_mode.currentText(),
-                                   self.pump_passes.value(), summary)
+            if stages is not None:
+                self._append_log("--- preparation sequence ---")
+                self.request_sequence.emit(params, list(self._sequence_rows),
+                                           self.burn_mode.currentText(),
+                                           summary)
+            else:
+                self._append_log("--- burn ---")
+                self.request_burn.emit(params, np.asarray(freqs),
+                                       self.burn_mode.currentText(),
+                                       self.pump_passes.value(), summary)
 
     # -- worker callbacks -------------------------------------------
 
@@ -1156,12 +1533,12 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Simulation error", msg)
 
     def _append_log(self, line):
-        stamp = time.strftime("%H:%M:%S")
+        stamp = time.strftime("[%d:%m:%Y %H:%M:%S]")
         if self._job_kind is not None and self._job_t0:
             el = max(0.0, time.monotonic() - self._job_t0)
             pre = f"{stamp} +{int(el) // 60:02d}:{int(el) % 60:02d}  "
         else:
-            pre = f"{stamp}  "
+            pre = f"{stamp} "
         text = "" if line is None else str(line)
         for phys in text.split("\n"):
             self.log_view.appendPlainText(pre + phys.rstrip())
@@ -1193,6 +1570,7 @@ class MainWindow(QMainWindow):
             "parallel": self.parallel_check.isChecked(),
             "h_width": self.h_width.value(),
             "in_width": self.in_width.value(),
+            "sequence": [dict(r) for r in self._sequence_rows],
         }
         for name in self._GUI_FIELDS:
             gui[name] = getattr(self, name).value()
@@ -1236,15 +1614,18 @@ class MainWindow(QMainWindow):
         for name in self._GUI_INTS:
             if name in gui:
                 getattr(self, name).setValue(int(gui[name]))
-        if gui.get("mode") in ("Single hole", "One comb", "Scan"):
+        if isinstance(gui.get("sequence"), list):
+            self._sequence_rows = [dict(r) for r in gui["sequence"]]
+        if gui.get("mode") in ("Single hole", "One comb", "Scan",
+                               "Preparation sequence"):
             self.mode_combo.setCurrentText(gui["mode"])
 
         self._mark_norm_stale()
         self._refresh_comb_preview()
 
     def _import_config(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Import config", "", "JSON (*.json)")
+        path = self._file_dialog("Import config", "", directory=False,
+                                 name_filter="JSON (*.json)")
         if not path:
             return
         try:
@@ -1276,8 +1657,7 @@ class MainWindow(QMainWindow):
 
     def _pick_sim_dir(self):
         start = self._sim_root or os.getcwd()
-        folder = QFileDialog.getExistingDirectory(
-            self, "Simulation folder", start)
+        folder = self._file_dialog("Simulation folder", start)
         if not folder:
             return
         if os.path.exists(os.path.join(folder, "manifest.json")):
@@ -1379,8 +1759,8 @@ class MainWindow(QMainWindow):
         self._on_scan_done(scan)
 
     def _open_run_folder(self):
-        path = QFileDialog.getExistingDirectory(
-            self, "Open a simulation folder", self._sim_root or os.getcwd())
+        path = self._file_dialog("Open a simulation folder",
+                                 self._sim_root or os.getcwd())
         if not path:
             return
         try:
@@ -1424,6 +1804,13 @@ class MainWindow(QMainWindow):
         mode = self.mode_combo.currentIndex()
         if mode == 0:
             return f"df{df:g}_hole_{self.centre.value():g}MHz"
+        if mode == 3:
+            names = []
+            for row in self._sequence_rows:
+                label = str(row.get("label", "")).strip().replace(" ", "")
+                if label and label not in names:
+                    names.append(label)
+            return f"df{df:g}_seq_{'-'.join(names) or 'empty'}"
         return (f"df{df:g}_comb_{self.tooth_spacing.value():g}MHz_"
                 f"{self.burn_width.value():g}MHz")
 
@@ -1433,8 +1820,7 @@ class MainWindow(QMainWindow):
                                    "Run a simulation before exporting.")
             return
         start = (self._scan.get("sim_dir") if self._scan else None) or ""
-        folder = QFileDialog.getExistingDirectory(
-            self, "Export to folder", start)
+        folder = self._file_dialog("Export to folder", start)
         if not folder:
             return
         try:
@@ -1536,6 +1922,47 @@ class MainWindow(QMainWindow):
                 note(path)
 
         return written
+
+    def _file_dialog(self, title, start="", *, directory=True, name_filter=""):
+        """
+        A file / folder picker with a usable size.
+
+        The one-line QFileDialog.getExistingDirectory / getOpenFileName
+        helpers take whatever geometry the platform hands back, which on some
+        desktops is a dialog too small to read - the folder picker for saving a
+        run was unusable. Building the dialog gives it an explicit size.
+        """
+        dlg = QFileDialog(self, title, start)
+        if directory:
+            dlg.setFileMode(QFileDialog.FileMode.Directory)
+            dlg.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        else:
+            dlg.setFileMode(QFileDialog.FileMode.ExistingFile)
+        if name_filter:
+            dlg.setNameFilter(name_filter)
+        dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        dlg.resize(900, 600)
+        if not dlg.exec():
+            return ""
+        chosen = dlg.selectedFiles()
+        return chosen[0] if chosen else ""
+
+    def _edit_sequence(self):
+        try:
+            params = self._collect_params()
+            shb.validate_params(params)
+        except Exception as exc:                        # noqa: BLE001
+            self._on_error(str(exc))
+            return
+        dlg = PulseSequenceDialog(self._sequence_rows, params, self)
+        if dlg.exec():
+            try:
+                self._sequence_rows = dlg.values()
+            except ValueError as exc:
+                self._on_error(f"bad sequence row: {exc}")
+                return
+            self._append_log(f"sequence updated: {len(self._sequence_rows)} rows")
+            self._refresh_comb_preview()
 
     def _edit_levels(self):
         dlg = LevelsDialog(self._crystal, self)

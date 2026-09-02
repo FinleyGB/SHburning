@@ -64,15 +64,18 @@ __all__ = [
     # core
     "to_steps", "build_transitions", "make_axes", "initial_populations",
     "burn_parallel", "burn_series", "spectrum", "run_burn",
-    "normalisation_factor",
-    # combs
-    "comb", "comb_at", "single_hole",
+    "burn_sequence", "run_sequence", "normalisation_factor",
+    # combs / preparation sequences
+    "comb", "comb_at", "comb_in", "single_hole",
+    "pulse_group", "sequence_stages", "anti_hole_pumps",
+    "peak_shadow_bands", "default_pit_width",
+    "prep_gem", "prep_narrowband_afc", "PREP_PRESETS",
     # scan
     "compute_one", "run_scan", "QUALITY_VERSION",
     # checkpointing / simulation folders
     "load_run", "inspect_run", "collect_top", "write_run_outputs",
     # plotting (matplotlib, draw onto an Axes)
-    "plot_spectrum", "plot_comb", "plot_populations",
+    "plot_spectrum", "plot_comb", "plot_sequence", "plot_populations",
     "plot_scan_heatmap", "plot_scan_max", "plot_top_spectra",
     # plotting (plotly, return a Figure)
     "plot_spectrum_plotly", "plot_scan_heatmap_plotly",
@@ -684,6 +687,69 @@ def run_burn(pump_freqs, params, burn=burn_parallel,
             "pump_freqs": np.asarray(pump_freqs)}
 
 
+def burn_sequence(rho, stages, trans_steps, det, det0, params,
+                  burn=burn_parallel, log=None):
+    """
+    Burn a preparation sequence: one stage after another, each acting on the
+    populations the previous stage left.
+
+    A preparation sequence is ordered by physics, not by bookkeeping. Burning
+    a pit and its burn-back pulses at the same time would empty the anti-hole
+    as fast as it was filled, and cleaning pulses only mean anything once
+    there is a peak to clean, so the stages cannot be pooled into one flat set
+    of pump frequencies the way a comb can.
+
+    Within a stage the pump frequencies are still handed to ``burn`` in one
+    call, so ``burn_parallel``'s "all present together" model (and
+    ``burn_series``'s one-after-another model) applies inside the stage exactly
+    as it does for a comb.
+
+    ``stages`` are as :func:`sequence_stages` returns them: dicts with
+    ``freqs``, an optional ``passes`` (``None`` uses the configured
+    ``pump_passes``) and a ``name`` for the log.
+    """
+    for st in stages:
+        freqs = np.asarray(st["freqs"], dtype=float)
+        if freqs.size == 0:
+            continue
+        rho = burn(rho, freqs, trans_steps, det, det0, params,
+                   st.get("passes"))
+        if log is not None:
+            log(f"  {st.get('name', 'stage')}: {freqs.size} pump frequencies"
+                f" x {st.get('passes') or settings(params)['pump_passes']}"
+                f" passes")
+    return rho
+
+
+def run_sequence(stages, params, burn=burn_parallel, fmin=None, fmax=None,
+                 ctx=None, log=None):
+    """
+    :func:`run_burn` for a preparation sequence: set up, burn the stages in
+    order, take the spectrum.
+
+    Returns the same dictionary as :func:`run_burn` - so every consumer of a
+    burn result (plots, exports) keeps working unchanged - plus
+
+        stages        the stages that were burned, in order
+
+    with ``pump_freqs`` holding every frequency the sequence used.
+    """
+    g, e, trans, trans_steps = build_transitions(params)
+    f, det, det0 = make_axes(params, trans_steps, fmin, fmax)
+    rho0 = initial_populations(g, det)
+    rho = burn_sequence(rho0, stages, trans_steps, det, det0, params,
+                        burn=burn, log=log)
+    spec = spectrum(rho, trans, det, f, params, ctx=ctx)
+
+    parts = [np.asarray(st["freqs"], dtype=float) for st in stages
+             if len(st["freqs"])]
+    pump_freqs = (np.unique(np.concatenate(parts)) if parts
+                  else np.array([], dtype=float))
+
+    return {"f": f, "spec": spec, "rho": rho, "rho0": rho0,
+            "det": det, "trans": trans, "trans_steps": trans_steps,
+            "pump_freqs": pump_freqs, "stages": stages}
+
 def normalisation_factor(params):
     """
     Peak absorption of the unburned crystal.
@@ -756,6 +822,422 @@ def comb_at(tooth_spacing, burn_width, params):
 
     return freqs, spacing_steps * df, width_steps * df, n_teeth
 
+
+def comb_in(tooth_spacing, burn_width, lo, hi, params):
+    """
+    A comb confined to ``[lo, hi]`` MHz rather than the whole config window.
+
+    Same geometry as :func:`comb_at` - teeth every ``tooth_spacing`` MHz, each
+    ``burn_width`` MHz wide, the first starting at ``lo`` - but bounded by a
+    band the caller chooses. A narrowband AFC burns its comb over a few MHz
+    inside a prepared pit, not across the whole inhomogeneous line, which is
+    what this is for.
+
+    Returns
+        freqs           the pump frequencies (MHz), exactly on the mesh
+        actual_spacing  the spacing, snapped to the mesh (MHz)
+        actual_width    the width, snapped to the mesh (MHz)
+        n_teeth         how many teeth fitted in the band
+    """
+    p = settings(params)
+    df = p["df"]
+
+    # to_steps rather than round: an off-mesh spacing, width or edge stops here.
+    spacing_steps = int(to_steps(tooth_spacing, df))
+    width_steps = int(to_steps(burn_width, df))
+    f0 = int(to_steps(lo, df))
+    f1 = int(to_steps(hi, df))
+
+    if spacing_steps < 1 or width_steps < 1:
+        raise ValueError("tooth spacing and burn width must be at least one "
+                         f"df step ({df} MHz)")
+    if f1 < f0:
+        raise ValueError(f"empty comb band: hi ({hi}) is below lo ({lo})")
+
+    n_teeth = (f1 - f0) // spacing_steps + 1
+    starts = f0 + spacing_steps * np.arange(n_teeth)
+    freqs = df * (starts[:, None] + np.arange(width_steps)[None, :]).ravel()
+
+    return freqs, spacing_steps * df, width_steps * df, n_teeth
+
+
+def pulse_group(centre, n_pulses, sweep, params):
+    """
+    A burst of ``n_pulses`` pump frequencies spread evenly over
+    ``centre +- sweep/2`` MHz.
+
+    This is the model's picture of a swept (chirped) burning pulse. The burn
+    engine sees a *set of frequencies* - it carries no intensity and no pulse
+    duration - so a sweep is represented by the frequencies it visits:
+
+    - ``n_pulses=1`` (or ``sweep=0``) is one pulse at ``centre``;
+    - ``n_pulses = sweep/df + 1`` fills every mesh bin in the span, which is
+      what a pit or a cleaning sweep wants;
+    - anything between is a coarser sweep that leaves gaps, exactly as a real
+      stepped chirp would.
+
+    The arithmetic is done in whole df steps, so every frequency returned is on
+    the mesh by construction; ``to_steps`` gates ``centre`` and ``sweep``, so an
+    off-mesh value stops here rather than being quietly rounded.
+    """
+    p = settings(params)
+    df = p["df"]
+
+    n = max(1, int(n_pulses))
+    c = int(to_steps(centre, df))
+    s = abs(int(to_steps(sweep, df)))
+    if n == 1 or s == 0:
+        return np.array([c * df])
+
+    offsets = np.round(np.linspace(-0.5 * s, 0.5 * s, n)).astype(np.int64)
+    return df * np.unique(c + offsets)
+
+
+def sequence_stages(rows, params):
+    """
+    Turn preparation-sequence rows into the stages :func:`burn_sequence` burns.
+
+    A row is ``{"label", "centre", "pulses", "sweep", "passes", "on"}`` - one
+    swept (or single) burning pulse, as entered in the GUI's sequence editor.
+    **Consecutive rows sharing a label become one stage**, burned together;
+    a change of label starts a new stage, burned afterwards on whatever
+    populations the previous stage left. That one rule covers both cases that
+    matter: the teeth of a comb (many rows, one label) go in at once, the way a
+    comb burn actually works, while a pit and its burn-back (different labels)
+    stay strictly ordered - burn them together and the anti-hole is simply
+    erased again.
+
+    A stage takes its pump-pass count from the first row of the group; ``None``
+    means "use the configured ``pump_passes``". Rows with ``on=False`` are
+    skipped.
+
+    Returns a list of ``{"name", "freqs", "passes"}``.
+    """
+    grouped = []
+    for row in rows:
+        if not row.get("on", True):
+            continue
+        label = str(row.get("label", "")).strip() or "stage"
+        freqs = pulse_group(row.get("centre", 0.0), row.get("pulses", 1),
+                            row.get("sweep", 0.0), params)
+        if grouped and grouped[-1]["name"] == label:
+            grouped[-1]["parts"].append(freqs)
+            continue
+        passes = row.get("passes")
+        passes = None if passes in (None, "") else int(passes)
+        grouped.append({"name": label, "parts": [freqs], "passes": passes})
+
+    return [{"name": st["name"],
+             "freqs": np.unique(np.concatenate(st["parts"])),
+             "passes": st["passes"]}
+            for st in grouped]
+
+
+def anti_hole_pumps(centre, params, *, avoid=None, limit=None):
+    """
+    The "burn back" pump frequencies that put absorption back at ``centre`` MHz.
+
+    Worked from the crystal's own level structure rather than written down, so
+    it follows whichever preset (or hand-edited level table) is loaded.
+
+    The reasoning: absorption at ``centre`` comes from the ion class at
+    detuning ``d0 = centre - trans[k0, m0]``, through whatever population it
+    holds in ground state ``k0``. A pit burned at ``centre`` has emptied that
+    ``k0`` - that is what makes the pit. Pumping any *other* transition
+    ``(k, m)``, ``k != k0``, of the same class - which sits at
+    ``trans[k, m] + d0`` - lifts those ions out of ``k`` and drops a share
+    ``dm[k0, m]`` of them back into ``k0``, so the class absorbs at ``centre``
+    again: an anti-hole inside the pit.
+
+    ``avoid=(lo, hi)`` excludes the pit itself. A pump inside the pit would
+    address ions the pit has already emptied (nothing left to move) and would
+    re-burn the pit at the same time, so those candidates are dropped.
+
+    Candidates are ranked by ``dm[k0, m0] * dm[k0, m]`` - how strongly the
+    route fills ``k0``, times how strongly ``k0`` then absorbs - and deduped by
+    frequency, since several routes can land on the same pump frequency.
+
+    Returns a list of ``{"freq", "target": (k0, m0), "via": (k, m), "weight"}``,
+    strongest first, truncated to ``limit`` if given.
+    """
+    p = settings(params)
+    df, dm = p["df"], p["dm"]
+    g, e, trans, trans_steps = build_transitions(params)
+    n_g, n_e = trans_steps.shape
+
+    c_steps = int(to_steps(centre, df))
+    lo = hi = None
+    if avoid is not None:
+        lo, hi = float(min(avoid)), float(max(avoid))
+
+    found = []
+    for k0 in range(n_g):
+        for m0 in range(n_e):
+            for k in range(n_g):
+                if k == k0:
+                    continue            # pumping k0 empties it again
+                for m in range(n_e):
+                    weight = float(dm[k0, m0] * dm[k0, m])
+                    if weight <= 0.0:
+                        continue
+                    # Integer steps throughout: the pump frequency is computed
+                    # on the mesh, not rounded onto it.
+                    nu_steps = (c_steps - int(trans_steps[k0, m0])
+                                + int(trans_steps[k, m]))
+                    nu = nu_steps * df
+                    if not (p["fmin"] <= nu <= p["fmax"]):
+                        continue
+                    if lo is not None and lo <= nu <= hi:
+                        continue
+                    found.append({"freq": float(nu), "target": (k0, m0),
+                                  "via": (k, m), "weight": weight,
+                                  "steps": nu_steps})
+
+    found.sort(key=lambda r: (-r["weight"], abs(r["steps"] - c_steps)))
+
+    seen, uniq = set(), []
+    for r in found:
+        if r["steps"] in seen:
+            continue
+        seen.add(r["steps"])
+        uniq.append({k: v for k, v in r.items() if k != "steps"})
+
+    return uniq if limit is None else uniq[:int(limit)]
+
+
+# ---------------------------------------------------------------------------
+# Preparation sequences
+#
+# Each builder returns editor *rows* - not frequencies - so a preset is a
+# starting point the sequence editor then lets you rearrange, retune or delete.
+# The defaults are derived from the loaded crystal wherever there is a sensible
+# way to derive them; they are a reasonable place to start, not a claim about
+# the one right recipe for your experiment.
+# ---------------------------------------------------------------------------
+
+def _span_row(label, lo_steps, hi_steps, df, passes):
+    """
+    A row filling every mesh bin from ``lo_steps`` to ``hi_steps`` inclusive.
+
+    The span is nudged up by one bin when it is odd, so the row's centre lands
+    on the mesh rather than half a step off it.
+    """
+    if hi_steps < lo_steps:
+        return None
+    span = hi_steps - lo_steps
+    if span % 2:
+        span += 1
+    return {"label": label, "centre": (lo_steps + span // 2) * df,
+            "pulses": int(span + 1), "sweep": span * df,
+            "passes": int(passes), "on": True}
+
+
+def peak_shadow_bands(centre, params, targets, peak_width):
+    """
+    The frequency bands a cleaning sweep must leave alone.
+
+    The ions that make an anti-hole at ``centre`` - class
+    ``d0 = centre - trans[k0, m0]``, holding population in ground state ``k0``
+    - do not only absorb at ``centre``. The same population absorbs on every
+    other transition out of ``k0``, at ``centre + trans[k0, m] - trans[k0, m0]``,
+    and several of those land inside the pit. A cleaning sweep that ignores
+    them pumps the peak's own ions straight back out and erases the feature it
+    was meant to sharpen - which is exactly what happens if you sweep the whole
+    pit bar the peak.
+
+    ``targets`` are the ``(k0, m0)`` pairs of the burn-back pulses being used
+    (the ``"target"`` field of :func:`anti_hole_pumps`). Returns merged,
+    ascending ``(lo, hi)`` MHz bands, each ``peak_width`` wide, including the
+    peak itself.
+    """
+    p = settings(params)
+    df = p["df"]
+    g, e, trans, trans_steps = build_transitions(params)
+    n_e = trans_steps.shape[1]
+
+    c = int(to_steps(centre, df))
+    half = max(0, int(round(float(peak_width) / df)) // 2)
+
+    raw = []
+    for k0, m0 in targets:
+        for m in range(n_e):
+            mid = c + int(trans_steps[k0, m]) - int(trans_steps[k0, m0])
+            raw.append((mid - half, mid + half))
+
+    merged = []
+    for lo, hi in sorted(raw):
+        if merged and lo <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return [(lo * df, hi * df) for lo, hi in merged]
+
+
+def _gap_rows(label, lo_steps, hi_steps, blocked_steps, df, passes):
+    """
+    Rows filling ``[lo_steps, hi_steps]`` except the ``blocked_steps`` bands -
+    a cleaning sweep with holes cut in it where the peak's ions absorb.
+    """
+    rows, cursor = [], lo_steps
+    for b_lo, b_hi in sorted(blocked_steps):
+        if b_hi < cursor or b_lo > hi_steps:
+            continue
+        rows.append(_span_row(label, cursor, min(b_lo - 1, hi_steps), df,
+                              passes))
+        cursor = max(cursor, b_hi + 1)
+    rows.append(_span_row(label, cursor, hi_steps, df, passes))
+    return [r for r in rows if r is not None]
+
+def default_pit_width(params):
+    """
+    A starting pit width: the full span of the ground-state manifold.
+
+    A pit has to be at least as wide as the ground splittings to empty ions
+    rather than just shuffle them between ground states, so the manifold span
+    (27.49 MHz for the tuned Pr:YSO preset) is the natural first guess.
+    """
+    p = settings(params)
+    gg = np.asarray(p["g"], dtype=float)
+    return float(gg.max() - gg.min())
+
+
+def prep_gem(params, *, centre=0.0, pit_width=None, peak_width=1.0,
+             n_burn_back=2, passes=20):
+    """
+    A gradient-echo-memory (GEM) preparation, as sequence-editor rows.
+
+    Three stages, burned in this order:
+
+    1. **pit** - a wide sweep centred on ``centre`` that empties every ion
+       class in the band, leaving a transparent window.
+    2. **burn back** - single pulses outside the pit, from
+       :func:`anti_hole_pumps`, that drop population back into the ground state
+       absorbing at ``centre``: a narrow anti-hole in the middle of the pit.
+    3. **clean** - sweeps over the rest of the pit, either side of a
+       ``peak_width`` MHz keep-out around ``centre``, removing the broad skirts
+       the burn-back pulses leave and narrowing the peak.
+
+    ``pit_width`` defaults to :func:`default_pit_width`.
+    """
+    p = settings(params)
+    df = p["df"]
+
+    c = int(to_steps(centre, df))
+    if pit_width is None:
+        pit_width = default_pit_width(params)
+    half = max(1, int(round(float(pit_width) / df)) // 2)
+    half_peak = max(0, int(round(float(peak_width) / df)) // 2)
+
+    pit_lo, pit_hi = (c - half) * df, (c + half) * df
+
+    rows = [_span_row("pit", c - half, c + half, df, passes)]
+
+    targets = []
+    for cand in anti_hole_pumps(centre, params, avoid=(pit_lo, pit_hi),
+                                limit=int(n_burn_back)):
+        rows.append({"label": "burn back", "centre": cand["freq"],
+                     "pulses": 1, "sweep": 0.0, "passes": int(passes),
+                     "on": True})
+        targets.append(cand["target"])
+
+    # The cleaning sweep fills the rest of the pit, but skips the peak *and*
+    # the other frequencies at which the peak's own ions absorb - see
+    # peak_shadow_bands. Sweeping straight over those erases the peak.
+    blocked = [(int(round(lo / df)), int(round(hi / df)))
+               for lo, hi in peak_shadow_bands(centre, params, targets,
+                                               2 * half_peak * df)]
+    if not blocked:
+        blocked = [(c - half_peak, c + half_peak)]
+    rows += _gap_rows("clean", c - half, c + half, blocked, df, passes)
+
+    return [r for r in rows if r is not None]
+
+
+def prep_narrowband_afc(params, *, centre=0.0, bandwidth=4.0,
+                        tooth_spacing=0.5, finesse=2.0, guard=1.0,
+                        n_burn_back=2, passes=20):
+    """
+    A narrowband AFC preparation, as sequence-editor rows.
+
+    The broadband AFC of :func:`comb_at` burns its comb straight into the
+    inhomogeneous line. A narrowband AFC instead prepares a clean band first
+    and then burns a comb over only a few MHz of it:
+
+    1. **pit** - a sweep over ``bandwidth + 2*guard`` MHz, emptying the band.
+    2. **burn back** - the :func:`anti_hole_pumps` frequencies, each *swept
+       across the bandwidth* rather than fired at a single frequency, so
+       absorption is restored across the whole AFC band instead of at one spot.
+    3. **afc comb** - teeth every ``tooth_spacing`` MHz, each
+       ``tooth_spacing / finesse`` MHz wide, confined to ``bandwidth`` MHz
+       around ``centre`` (:func:`comb_in`). All the teeth share one label, so
+       they burn together the way a comb burn does.
+
+    The storage time the comb gives is ``1 / tooth_spacing`` (0.5 MHz -> 2 us).
+    """
+    p = settings(params)
+    df = p["df"]
+
+    c = int(to_steps(centre, df))
+    band = max(2, int(round(float(bandwidth) / df)))
+    guard_steps = max(0, int(round(float(guard) / df)))
+    half_band = band // 2
+
+    pit_lo_steps = c - half_band - guard_steps
+    pit_hi_steps = c + half_band + guard_steps
+    rows = [_span_row("pit", pit_lo_steps, pit_hi_steps, df, passes)]
+
+    for cand in anti_hole_pumps(centre, params,
+                                avoid=(pit_lo_steps * df, pit_hi_steps * df),
+                                limit=int(n_burn_back)):
+        rows.append({"label": "burn back", "centre": cand["freq"],
+                     "pulses": int(2 * half_band + 1),
+                     "sweep": (2 * half_band) * df,
+                     "passes": int(passes), "on": True})
+
+    lo_steps, hi_steps = c - half_band, c + half_band
+    tooth_width = max(df, float(tooth_spacing) / max(1e-9, float(finesse)))
+    tooth_width = max(1, int(round(tooth_width / df))) * df
+    freqs, sp, wd, n_teeth = comb_in(tooth_spacing, tooth_width,
+                                     lo_steps * df, hi_steps * df, params)
+    width_steps = int(round(wd / df))
+    starts = np.round(freqs.reshape(n_teeth, width_steps)[:, 0] / df)
+    for s0 in starts.astype(np.int64):
+        if s0 + width_steps - 1 > hi_steps:
+            continue                    # a last tooth hanging out of the band
+        rows.append(_span_row("afc comb", int(s0), int(s0) + width_steps - 1,
+                              df, passes))
+
+    return [r for r in rows if r is not None]
+
+
+#: The preparation presets offered by the GUI's sequence editor. Each entry
+#: carries its builder plus the fields the editor exposes for it, as
+#: ``(kwarg, label, default, decimals)``; a callable default is resolved
+#: against the current params, and ``decimals=0`` means an integer field.
+PREP_PRESETS = {
+    "Gradient echo memory (GEM)": {
+        "builder": prep_gem,
+        "fields": [
+            ("centre", "centre (MHz)", 0.0, 3),
+            ("pit_width", "pit width (MHz)", default_pit_width, 3),
+            ("peak_width", "peak width (MHz)", 1.0, 3),
+            ("n_burn_back", "burn-back pulses", 2, 0),
+            ("passes", "pump passes per stage", 20, 0),
+        ],
+    },
+    "Narrowband AFC": {
+        "builder": prep_narrowband_afc,
+        "fields": [
+            ("centre", "centre (MHz)", 0.0, 3),
+            ("bandwidth", "AFC bandwidth (MHz)", 4.0, 3),
+            ("tooth_spacing", "tooth spacing (MHz)", 0.5, 3),
+            ("finesse", "finesse", 2.0, 2),
+            ("guard", "pit guard band (MHz)", 1.0, 3),
+            ("n_burn_back", "burn-back pulses", 2, 0),
+            ("passes", "pump passes per stage", 20, 0),
+        ],
+    },
+}
 
 # ===========================================================================
 # Scan
@@ -2166,12 +2648,8 @@ def plot_comb(ax, pump_freqs, params, *, title=None, show_xlabel=True):
     f1 = int(to_steps(p["fmax"], df))
     axis = df * np.arange(f0, f1 + 1)
 
-    mask = np.zeros(len(axis))
     pf = np.asarray(pump_freqs, dtype=float)
-    if pf.size:
-        idx = np.round((pf - p["fmin"]) / df).astype(int)
-        idx = idx[(idx >= 0) & (idx < len(mask))]
-        mask[idx] = 1.0
+    mask = _pump_mask(pf, axis, p["fmin"], df)
 
     ax.fill_between(axis, mask, step="mid", color="C0", alpha=0.8, lw=0)
     if show_xlabel:
@@ -2184,6 +2662,59 @@ def plot_comb(ax, pump_freqs, params, *, title=None, show_xlabel=True):
     ax.set_title(title)
     return ax
 
+
+def _pump_mask(pump_freqs, axis, fmin, df):
+    """Height-1-where-pumped step trace for a set of pump frequencies."""
+    mask = np.zeros(len(axis))
+    pf = np.asarray(pump_freqs, dtype=float)
+    if pf.size:
+        idx = np.round((pf - fmin) / df).astype(int)
+        idx = idx[(idx >= 0) & (idx < len(mask))]
+        mask[idx] = 1.0
+    return mask
+
+
+def plot_sequence(ax, stages, params, *, title=None, show_xlabel=True):
+    """
+    The staged version of the :func:`plot_comb` panel, for a preparation
+    sequence.
+
+    One band per stage, stacked bottom-to-top in burn order and labelled on the
+    y axis, so both *what* each stage burns and *when it burns it* are readable
+    at a glance - a pit and the burn-back pulses sitting outside it would be
+    indistinguishable if they were drawn on top of each other.
+
+    ``show_xlabel=False`` drops the x-axis label, for when this sits on top of
+    the spectrum panel sharing its Frequency axis.
+    """
+    p = settings(params)
+    df = p["df"]
+    f0 = int(to_steps(p["fmin"], df))
+    f1 = int(to_steps(p["fmax"], df))
+    axis = df * np.arange(f0, f1 + 1)
+
+    n_total = 0
+    ticks, labels = [], []
+    for i, st in enumerate(stages):
+        freqs = np.asarray(st["freqs"], dtype=float)
+        n_total += freqs.size
+        mask = _pump_mask(freqs, axis, p["fmin"], df)
+        ax.fill_between(axis, i + 0.8 * mask, i, step="mid",
+                        color=f"C{i % 10}", alpha=0.8, lw=0)
+        ticks.append(i + 0.4)
+        labels.append(str(st.get("name", f"stage {i + 1}")))
+
+    if show_xlabel:
+        ax.set_xlabel("Frequency (MHz)")
+    ax.set_ylabel("Burn order")
+    ax.set_ylim(-0.1, max(1, len(stages)) + 0.1)
+    ax.set_yticks(ticks)
+    ax.set_yticklabels(labels, fontsize="small")
+    if title is None:
+        title = (f"Preparation sequence: {len(stages)} stages, "
+                 f"{n_total} pump frequencies")
+    ax.set_title(title)
+    return ax
 
 def plot_populations(ax, out, *, title="Ion classes addressed by the burn",
                      xlim=None, ylim=None):
@@ -2431,6 +2962,27 @@ def _smoke():
     print(f"Absorption {spec.min():.2f} to {spec.max():.2f}  "
           f"(dAbsorption {spec.max() - spec.min():.2f}, "
           f"unburned {settings(params)['alpha']:.2f})")
+
+    # And a preparation sequence, on a coarser mesh so this stays a smoke test:
+    # a GEM pit, its burn-back anti-hole and the cleaning sweeps, burned in
+    # order. There is no test suite, so this is the check that the staged path
+    # still runs end to end.
+    seq_params = _default_params()
+    seq_params["numerical_params"]["df"] = 0.01
+    validate_params(seq_params)
+    # Its own norm: the unburned peak depends on df, so reusing the fine-mesh
+    # one above would scale this spectrum wrongly.
+    seq_params["output_params"]["norm"] = normalisation_factor(seq_params)
+
+    rows = prep_gem(seq_params, peak_width=1.0, passes=4)
+    stages = sequence_stages(rows, seq_params)
+    seq = run_sequence(stages, seq_params, burn=burn_parallel)
+    centre = int(np.argmin(np.abs(seq["f"])))
+    print(f"GEM sequence: {len(stages)} stages "
+          f"({', '.join(st['name'] for st in stages)}), "
+          f"{seq['pump_freqs'].size} pump frequencies")
+    print(f"Absorption {seq['spec'].min():.2f} to {seq['spec'].max():.2f}  "
+          f"(at the pit centre {seq['spec'][centre]:.2f})")
 
 
 def _cli_load_config(path):

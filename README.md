@@ -69,7 +69,7 @@ others are transcribed from the original MATLAB source
 Each preset also carries a suggested `fmin/fmax/df`; the GUI writes those into the
 fields when you pick it. The core handles any square `n×n` level structure.
 
-Three ways to use it, mirrored by the GUI's **mode** selector:
+Four ways to use it, mirrored by the GUI's **mode** selector:
 
 1. **Single hole** - one pump frequency, burned `pump_passes` times.
 2. **One comb** - a comb of teeth (`tooth_spacing`, `burn_width` in MHz), snapped
@@ -112,6 +112,67 @@ Three ways to use it, mirrored by the GUI's **mode** selector:
    growing with the grid. A pre-flight check estimates the memory a worker
    needs and clamps `n_workers`/`top_n` (or refuses to start, with a specific
    fix to try) rather than letting the sweep swap or get OOM-killed.
+4. **Preparation sequence** - an ordered list of burning pulses, for the
+   features a single comb cannot make: a GEM peak, a narrowband AFC. See
+   *Preparation sequences* below.
+
+### Preparation sequences
+
+A comb is one flat set of pump frequencies, all burned at once. A *preparation
+sequence* is ordered: each stage burns onto the populations the previous stage
+left. That ordering is physics, not bookkeeping - burn a pit and its burn-back
+pulses simultaneously and the anti-hole is erased as fast as it is filled.
+
+A sequence is built from **rows**, one per burning pulse:
+
+| field | meaning |
+| --- | --- |
+| `label` | the stage this row belongs to |
+| `centre` | centre frequency (MHz), on the `df` mesh |
+| `pulses` | how many pump frequencies the row fires |
+| `sweep` | the frequency span they are spread over (MHz) |
+| `passes` | pump passes for this stage (blank = the configured `pump_passes`) |
+| `on` | untick to keep a row without burning it |
+
+`shb.pulse_group(centre, pulses, sweep, params)` expands a row: `pulses=1` is a
+single pulse at `centre`, `pulses = sweep/df + 1` fills every mesh bin in the
+span (a pit or a cleaning sweep), anything between is a coarser stepped chirp.
+**Consecutive rows sharing a label form one stage**, burned together - so the
+teeth of a comb (many rows, one label) go in at once as a comb burn does, while
+a pit and its burn-back (different labels) stay strictly ordered.
+`shb.sequence_stages(rows, params)` does the grouping;
+`shb.run_sequence(stages, params)` burns them and returns exactly what
+`run_burn` returns, plus `stages`.
+
+Two presets (`shb.PREP_PRESETS`, the *Load preset* button in the editor) build
+their rows from **the loaded crystal's own level structure** rather than from
+written-down numbers, so they follow whichever preset or hand-edited level table
+is in use:
+
+- **Gradient echo memory (GEM)** - `shb.prep_gem`. A wide *pit* empties the
+  band; *burn back* pulses outside the pit push population into the ground state
+  that absorbs at the centre, giving a narrow anti-hole; *clean* sweeps take out
+  the rest of the pit and deepen the floor around it.
+- **Narrowband AFC** - `shb.prep_narrowband_afc`. Pit and burn-back as above,
+  the burn-back *swept across the band* so the whole band absorbs again, then an
+  *afc comb* (`shb.comb_in`) burned over a few MHz inside it rather than across
+  the whole inhomogeneous line.
+
+Two helpers carry the physics:
+
+- `shb.anti_hole_pumps(centre, params, avoid=(lo, hi))` - the burn-back
+  frequencies. Absorption at `centre` comes from the class
+  `d0 = centre - trans[k0, m0]` through its population in ground state `k0`,
+  which the pit emptied. Pumping any *other* transition `(k, m)` of that class,
+  at `trans[k, m] + d0`, drops a share `dm[k0, m]` back into `k0`. Candidates
+  inside the pit are dropped (nothing left there to move, and it would re-burn
+  the pit) and the rest are ranked by `dm[k0, m0] * dm[k0, m]`.
+- `shb.peak_shadow_bands(centre, params, targets, peak_width)` - the bands a
+  cleaning sweep must skip. The peak's own ions also absorb at
+  `centre + trans[k0, m] - trans[k0, m0]` for every other `m`, and several of
+  those sit inside the pit; sweeping over them pumps the peak straight back out.
+  `prep_gem` cuts these gaps into its cleaning rows - without them the cleaning
+  stage destroys the feature it is meant to sharpen.
 
 ### Simulation folders (checkpoint / resume)
 
@@ -171,7 +232,10 @@ The left column has two tabs.
 - **Simulation Parameters** - `fmin`/`fmax`/`df`, `h_width`/`in_width`,
   `pump_passes`, burn mode, `alpha`, the mode selector and its fields (Scan:
   storage-time min/max (µs) + **storage-time points**, finesse min/max +
-  **finesse points**, target window, keep top N, multiprocessing on by default),
+  **finesse points**, target window, keep top N, multiprocessing on by default;
+  Preparation sequence: an *Edit sequence…* dialog - a table of pulse rows, the
+  GEM / narrowband-AFC presets with their parameters, and add / remove / reorder
+  buttons, since the row order is the burn order),
   **Run** (becomes **Cancel** while busy) and a progress bar. The bar shows an
   elapsed timer for a single burn, and for a scan an up-front time estimate
   followed by a live `done/total · ~mm:ss left` readout.
@@ -188,7 +252,8 @@ from the run), then *Export…* picks the folder. Written files, for prefix `P`:
 | data | `P_spectrum.npy` (`vstack[f,spec]`), `P_spectrum.csv` | `P_results.csv` (`spacing_MHz,width_MHz,finesse,storage_us,quality`), `P_top_spectra.npy` (row 0 = `f`, then each kept spectrum), `P_scan.pkl` |
 
 Right column: one figure with the **pump comb** on top and the **spectrum**
-below, sharing the Frequency axis - **left-drag across it to zoom the x-axis**
+below, sharing the Frequency axis. A preparation sequence draws the top panel as
+one band per stage, stacked in burn order and labelled on the y-axis - **left-drag across it to zoom the x-axis**
 (as in the notebook's plotly plots), **double-click or the Home button to reset**,
 or use the toolbar. A scan replaces both with a single full-height view: the
 **AFC comb-quality heatmap** over storage time (`1/tooth_spacing`, µs) x finesse
@@ -196,8 +261,10 @@ or use the toolbar. A scan replaces both with a single full-height view: the
 finesse at each storage time), or *top spectra* - chosen by the *Scan view*
 dropdown. In the top-spectra view the legend is a scrollable side panel of
 per-trace checkboxes; toggling one hides that spectrum and rescales the y-axis to
-what is left. Below is the **Simulation run log**, whose lines are timestamped and,
-during a run, carry the elapsed time and a periodic solver-status line.
+what is left. Below is the **Simulation run log**, whose lines are stamped
+`[dd:mm:yyyy hh:mm:ss]` and, during a run, carry the elapsed time and a periodic
+solver-status line. Both left-hand tabs scroll, so no control is out of reach on
+a short window.
 
 **Import config** reads a `P_config.json` back and restores the whole session -
 crystal preset, levels, linewidths, numerical fields, mode and its fields, the
@@ -217,7 +284,7 @@ module falls back to a small inline rcParams set.
 
 | file | purpose |
 | --- | --- |
-| `shb.py` | the simulator: config, core physics, combs, scan, plot helpers, `apply_style()` |
+| `shb.py` | the simulator: config, core physics, combs, preparation sequences, scan, plot helpers, `apply_style()` |
 | `shb_gui.py` | the PyQt6 GUI |
 | `signature.mplstyle` | shared matplotlib style, ported from `SHsimulation_v1_7.ipynb` |
 | `worker.py` | thin `from shb import *` shim, kept so `SHsimulation_v1_3test2multi.ipynb` still runs |

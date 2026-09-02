@@ -35,7 +35,8 @@ python shb.py collect --sim-dir runs/afc1
 
 There is no test suite. Before and after touching `shb.py`'s scan path,
 sanity-check with the smoke test and a small before/after `run_scan` diff -
-see *Verifying a change* below.
+see *Verifying a change* below. The smoke test also burns a GEM preparation
+sequence, so it covers the staged path too.
 
 ## The one invariant that silently corrupts results
 
@@ -44,6 +45,33 @@ window edges, to within `1e-6` of a whole step. `validate_params` and
 `to_steps` enforce this and raise `ValueError` otherwise - never bypass them.
 The core works in integer *steps*, not raw MHz; a frequency that hasn't been
 through `to_steps` should not be turned into a bin index by hand.
+
+## Preparation sequences
+
+`run_scan` and `run_burn` both burn one flat set of pump frequencies.
+`run_sequence` burns a *sequence*: `burn_sequence` calls the chosen burn
+function once per stage, each on the populations the last stage left. Ordering
+is physics - pit, then burn back, then clean - so never pool stages into one
+frequency array "to save a call".
+
+The row -> stage rule lives in `sequence_stages`: **consecutive rows sharing a
+label are one stage**, burned together. That is what keeps comb teeth
+simultaneous while a pit and its burn-back stay ordered; don't change it to
+"one row, one stage" without re-reading why.
+
+`run_sequence` returns `run_burn`'s dict plus `stages`, which is what lets the
+GUI's plot and export paths stay unchanged - keep that shape.
+
+Two helpers hold the physics, and both are derived from the crystal rather than
+written down, so they follow whichever level table is loaded:
+
+- `anti_hole_pumps` - which pump frequencies refill the ground state that
+  absorbs at a given frequency (and why candidates inside the pit are useless).
+- `peak_shadow_bands` - the other frequencies at which a peak's own ions
+  absorb. `prep_gem` cuts these out of its cleaning sweeps; without that the
+  cleaning stage erases the anti-hole (measured: centre absorption 1.31 -> 0.22).
+  If you touch the cleaning rows, re-check the centre absorption stays above
+  `alpha`.
 
 ## Scan architecture
 
@@ -149,6 +177,9 @@ There's no test suite, so lean on these:
 3. If touching checkpointing: start a scan with `sim_dir` set, `kill -9` it
    mid-sweep, resume it, and confirm the result equals an uninterrupted run
    of the same grid.
+4. If touching the sequence path: a one-stage sequence must give a spectrum
+   bit-identical to `run_burn` on the same frequencies, and reordering the GEM
+   stages must change the answer (burn back before the pit kills the peak).
 
 ## Don't commit generated artefacts
 
