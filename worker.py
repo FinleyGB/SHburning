@@ -7,7 +7,10 @@ notebook ``SHsimulation_v1_3test2multi.ipynb`` still runs with its
 
 The single-thread BLAS environment variables are set here, before numpy is
 imported anywhere, because that is what keeps a multiprocessing.Pool scan from
-oversubscribing the cores.
+oversubscribing the cores. ``shb.py`` now sets the same block itself, ahead of
+its own numpy import, so scripts and the GUI get it too; this copy stays
+because a notebook importing this module has to get in before numpy either way.
+``setdefault`` makes the duplication harmless.
 """
 
 import os

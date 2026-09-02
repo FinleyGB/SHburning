@@ -28,12 +28,29 @@ this.
 from __future__ import annotations
 
 import copy
+import csv
+import hashlib
 import json
 import os
+import socket
 import sys
+import tempfile
 import time
-from functools import partial
+import traceback
 from pathlib import Path
+
+# Single-thread BLAS and FFT. These variables bind when numpy is imported, so
+# they have to be set before it - which is also why worker.py carries the same
+# block, for the notebooks that import it ahead of this module. A scan gets its
+# parallelism from multiprocessing, so a threaded BLAS inside each of a dozen
+# worker processes only fights itself for cores and adds a thread stack per core
+# per worker.
+_BLAS_THREAD_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                     "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
+                     "NUMEXPR_NUM_THREADS")
+for _var in _BLAS_THREAD_VARS:
+    os.environ.setdefault(_var, "1")
+del _var
 
 import numpy as np
 
@@ -51,7 +68,9 @@ __all__ = [
     # combs
     "comb", "comb_at", "single_hole",
     # scan
-    "compute_one", "run_scan",
+    "compute_one", "run_scan", "QUALITY_VERSION",
+    # checkpointing / simulation folders
+    "load_run", "inspect_run", "collect_top", "write_run_outputs",
     # plotting (matplotlib, draw onto an Axes)
     "plot_spectrum", "plot_comb", "plot_populations",
     "plot_scan_heatmap", "plot_scan_max", "plot_top_spectra",
@@ -164,6 +183,12 @@ def _default_params():
 
 
 DEFAULT_PARAMS = _default_params()
+
+# Bump whenever _score_quality's formula changes (see the reminder on that
+# function). It goes into every simulation folder's manifest, so a resume
+# against an old checkpoint is refused rather than silently mixing two
+# versions of the metric into one results table.
+QUALITY_VERSION = 1
 
 
 def _preset(g, e, dm, h_width, in_width, fmin, fmax, df):
@@ -413,6 +438,18 @@ def burn_parallel(rho, pump_freqs, trans_steps, det, det0, params,
 
     n_det = len(det)
 
+    # Working buffers, allocated once and refilled each pass rather than built
+    # anew. ``landing`` is the big one - n_g x n_g x n_det, so tens of MB at a
+    # fine mesh and hundreds at a refined one - and a scan holds one of these
+    # per worker process, so rebuilding it every pass is what pushed a long
+    # sweep into swap.
+    hits = np.zeros_like(rho)
+    landing = np.zeros((n_g, n_g, n_det))
+    outer_buf = np.empty((n_g, n_det))
+    mask = np.empty(rho.shape, dtype=bool)
+    excited = np.empty_like(rho)
+    acc = np.empty_like(rho)
+
     for _ in range(pump_passes):
 
         # hits[k, d]        how many addressed transitions take ions out of
@@ -423,8 +460,8 @@ def burn_parallel(rho, pump_freqs, trans_steps, det, det0, params,
         # for a final correctness check. Behaviour is left exactly as it was;
         # only the per-pump-frequency Python loop is replaced by a bincount, so
         # a fine comb (tens of thousands of pump frequencies) is no longer slow.
-        hits = np.zeros_like(rho)
-        landing = np.zeros((n_g, n_g, n_det))
+        hits.fill(0.0)
+        landing.fill(0.0)
 
         for k in range(n_g):
             for m in range(n_e):
@@ -436,17 +473,29 @@ def burn_parallel(rho, pump_freqs, trans_steps, det, det0, params,
                     continue
                 counts = np.bincount(d, minlength=n_det)
                 hits[k] += counts
-                landing[:, k, :] += dm[:, m][:, None] * counts[None, :]
+                np.multiply(dm[:, m][:, None], counts, out=outer_buf)
+                landing[:, k, :] += outer_buf
 
         # The ions leave. A class addressed three times over still only has
-        # one population to give, so this is a mask, not a count.
-        excited = rho * (hits > 0)
+        # one population to give, so this is a mask, not a count. The mask is
+        # kept because the divide below needs the same test.
+        np.greater(hits, 0, out=mask)
+        np.multiply(rho, mask, out=excited)
 
         # And come back down, sharing equally between the branchings of
         # whichever transitions took them.
-        share = np.divide(landing, hits,
-                          out=np.zeros_like(landing), where=hits > 0)
-        rho = rho - excited + (share * excited).sum(axis=1)
+        #
+        # The share is written back over ``landing`` instead of into a second
+        # array that size. That is safe rather than merely thrifty: hits[k, d]
+        # and landing[:, k, d] are accumulated from the same ``counts``, and a
+        # bincount is never negative, so hits[k, d] == 0 implies
+        # landing[:, k, d] == 0 exactly - the entries ``where`` skips already
+        # hold the 0.0 that the old ``out=np.zeros_like(landing)`` supplied.
+        np.divide(landing, hits, out=landing, where=mask)
+        landing *= excited
+        np.sum(landing, axis=1, out=acc)
+        rho -= excited
+        rho += acc
 
     return rho
 
@@ -724,6 +773,9 @@ def _fmt_dur(seconds):
     return f"{s}s"
 
 
+# NOTE: this function is still being tuned (see the git history) - bump
+# QUALITY_VERSION above whenever its formula changes, or a resumed scan will
+# silently mix qualities computed two different ways into one results table.
 def _score_quality(f, spec, target_window, spacing_mhz):
     """
     AFC comb-quality score over ``target_window`` MHz at the centre of ``f``.
@@ -801,6 +853,149 @@ def _score_quality(f, spec, target_window, spacing_mhz):
     return float(np.clip(float(v_j.mean()) * uniformity * purity, 0.0, 1.0))
 
 
+def _estimate_worker_bytes(params, min_finesse=1.0):
+    """
+    Rough peak-RSS estimate for one scan worker, in bytes.
+
+    Cheap and allocation-free (``build_transitions`` only touches arrays sized
+    by the crystal, n_g x n_e): the context (axes, initial populations, the FFT
+    kernel), one burn pass's buffers (:func:`burn_parallel`, since the scan
+    default), the spectrum's FFT transients, and the worst-case pump-frequency
+    arrays at ``min_finesse`` (a narrow tooth walks the whole comb). The flat
+    120 MB is the interpreter/numpy/scipy baseline, measured rather than
+    derived from the code.
+
+    Returns ``(total_bytes, breakdown)`` where ``breakdown`` is a dict of the
+    same pieces, for an honest log line.
+    """
+    p = settings(params)
+    df = float(p["df"])
+    fmin, fmax = float(p["fmin"]), float(p["fmax"])
+    n_f = int(round((fmax - fmin) / df)) + 1
+
+    _, _, _, trans_steps = build_transitions(params)
+    n_g, n_e = trans_steps.shape
+    pad = int(np.abs(trans_steps).max())
+    n_det = n_f + 2 * pad
+
+    conv_len = 3 * n_det - 2
+    try:
+        from scipy.fft import next_fast_len
+        nfft = int(next_fast_len(conv_len))
+    except ImportError:
+        nfft = 1 << int(np.ceil(np.log2(max(conv_len, 1))))
+
+    context = 8 * (n_f + 2 * n_det + n_g * n_det) + 8 * nfft
+    burn = 8 * n_det * (n_g * n_g + 4 * n_g + 1) + n_g * n_det
+    spectrum = 24 * nfft + 8 * n_g * n_det
+    n_pump = (fmax - fmin) / max(min_finesse * df, df)
+    pump = 6 * 8 * n_pump
+    baseline = 120_000_000
+
+    breakdown = {"context": context, "burn": burn, "spectrum": spectrum,
+                "pump": pump, "baseline": baseline}
+    return sum(breakdown.values()), breakdown
+
+
+def _available_bytes():
+    """
+    Best-effort available RAM, in bytes, and where the number came from.
+
+    ``psutil`` (optional - see requirements.txt) gives "available", which
+    accounts for a reclaimable page cache and is what actually matters; without
+    it, ``/proc/meminfo``'s ``MemAvailable`` on Linux, or half of total physical
+    memory elsewhere (macOS has no ``SC_AVPHYS_PAGES``; the total is all
+    ``os.sysconf`` can give, so the half is a deliberately coarse margin - said
+    so in the log line, not left implicit).
+    """
+    try:
+        import psutil
+        return int(psutil.virtual_memory().available), "psutil"
+    except ImportError:
+        pass
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024, "/proc/meminfo"
+    except OSError:
+        pass
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        return int(0.5 * pages * page_size), "half of total (coarse)"
+    except (ValueError, OSError):
+        return 4_000_000_000, "unknown - guessed 4 GB"
+
+
+def _fmt_bytes(n):
+    """A byte count as a short human string: '280 MB', '5.6 GB'."""
+    n = float(n)
+    for unit in ("bytes", "kB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit in ("bytes", "kB") else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def _resolve_scan_df(t_targets, params, finesse_min):
+    """
+    The df a scan actually burns at, after auto-refinement.
+
+    Tooth spacing is 1/t, quantised to df, so two close storage times can
+    round to the same comb; this refines df by a whole factor (so it still
+    divides the crystal levels and the window edges) until consecutive
+    spacings are at least one step apart - bounded below by what is
+    physically meaningful (~h_width/5), by a cap on the spectrum array size,
+    and by what a worker can hold in memory.
+
+    Factored out of :func:`run_scan` so anything previewing a scan before
+    running it - the GUI's resume/mismatch check, chiefly - computes the same
+    df_used a checkpoint will actually be keyed on, rather than comparing
+    against the unrefined df and reporting a spurious mismatch.
+
+    Returns ``(df, capped_by_memory)``.
+    """
+    p = settings(params)
+    df_user = p["df"]
+    _avail_bytes, _ = _available_bytes()
+    # Leave room for the parent (which builds one context itself, for the
+    # timing probe) and the OS; a single refined worker still has to fit.
+    _refine_ceiling = max(1, 0.5 * _avail_bytes)
+    df = df_user
+    spacings = 1.0 / t_targets
+    min_gap = (float(np.min(np.abs(np.diff(spacings)))) if len(spacings) > 1
+               else df_user)
+    capped_by_memory = False
+    if min_gap < df_user:
+        floor = min(df_user, max(1e-4, 0.2 * float(p["h_width"])))
+        floor = max(floor,
+                    (float(p["fmax"]) - float(p["fmin"])) / 2_000_000)
+        # Capped well below the old 500x: a refine that steep is a runaway in
+        # burn time as much as memory (more, smaller-spaced burns, each one
+        # over a finer, slower mesh), and it was reachable silently before.
+        want = min(20, int(np.ceil(df_user / max(min_gap, floor))))
+        edges = np.concatenate([np.asarray(p["g"], float),
+                                np.asarray(p["e"], float),
+                                [float(p["fmin"]), float(p["fmax"])]])
+        for k in range(max(1, want), 0, -1):
+            cand = df_user / k
+            if cand < floor and k > 1:
+                continue
+            try:
+                to_steps(edges, cand)
+            except ValueError:
+                continue
+            cand_params = copy.deepcopy(params)
+            cand_params["numerical_params"]["df"] = cand
+            if _estimate_worker_bytes(cand_params,
+                                      min_finesse=finesse_min)[0] > _refine_ceiling:
+                capped_by_memory = True
+                continue
+            df = cand
+            break
+    return df, capped_by_memory
+
+
 def _scan_context(params, burn, pump_passes, target_window):
     """
     The parts of a scan point that are the same for every point - built once by
@@ -822,7 +1017,7 @@ def _scan_context(params, burn, pump_passes, target_window):
 
 
 def compute_one(item, params=None, burn=None, pump_passes=None,
-                df=None, target_window=None, ctx=None):
+                df=None, target_window=None, ctx=None, want_spec=True):
     """
     One scan point, pulled out of the loop so it can run in a worker process.
 
@@ -831,6 +1026,14 @@ def compute_one(item, params=None, burn=None, pump_passes=None,
         result_row = (spacing_MHz, width_MHz, quality)
         record     = (quality, n, spec, spacing_MHz, width_MHz, f)
     ``quality`` is the AFC comb-quality score (:func:`_score_quality`).
+
+    With ``want_spec=False`` the record is the short form
+    ``(quality, n, spacing_MHz, width_MHz)`` - no spectrum, no frequency axis.
+    That is what a scan sweep uses: a spectrum and its axis are ~1.6 MB at
+    df 0.001, so returning them for every point pickles gigabytes back into the
+    parent process to keep a few dozen. :func:`run_scan` recomputes the
+    winners' spectra afterwards instead. The default is ``True`` so the
+    notebooks still get the six-tuple.
 
     Pass ``ctx`` (from :func:`_scan_context`) for the fast path: the transition
     table, axes, initial populations and spectrum FFT setup are reused instead of
@@ -858,16 +1061,71 @@ def compute_one(item, params=None, burn=None, pump_passes=None,
     quality = _score_quality(f, spec, target_window, spacing_mhz)
 
     result_row = (spacing_mhz, width_mhz, quality)
-    record = (quality, n, spec, spacing_mhz, width_mhz, f)
+    if want_spec:
+        record = (quality, n, spec, spacing_mhz, width_mhz, f)
+    else:
+        record = (quality, n, spacing_mhz, width_mhz)
     return result_row, record
+
+
+# Set by :func:`_init_worker` in each pool process. The scan context is built
+# once per worker and left here, rather than travelling with every task.
+_WORKER_CTX = None
+
+
+def _init_worker(params, burn, pump_passes, target_window):
+    """
+    Pool initialiser: build the scan context inside the worker process.
+
+    Only small things cross the pipe - ``params`` (scalars plus the branching
+    matrix) and a reference to the burn function. The axes, initial populations
+    and FFT setup, 12 MB at df 0.001 and ten times that at a refined mesh, are
+    built here.
+
+    Handing ``partial(compute_one, ctx=ctx)`` to ``Pool.imap`` instead looks
+    like it pickles the context once, but CPython pickles ``(func, chunk)``
+    once per task *chunk*, so the whole context went down the task queue
+    ``4 * n_workers`` times a sweep.
+    """
+    global _WORKER_CTX
+    _WORKER_CTX = _scan_context(params, burn, pump_passes, target_window)
+
+
+def _run_point(item):
+    """One scan point in a worker process: the score record, no spectrum."""
+    return compute_one(item, ctx=_WORKER_CTX, want_spec=False)[1]
+
+
+def _spectrum_at(item, ctx):
+    """
+    The spectrum of one scan point, for :func:`run_scan`'s collect pass.
+
+    ``item`` is ``(row, (spacing_steps, width_steps))``, where ``row`` is the
+    slot to fill in the caller's array. Returns ``(row, spec)`` - the frequency
+    axis is left behind, because every kept record shares the parent's.
+    """
+    row, (spacing_steps, width_steps) = item
+    params = ctx["params"]
+    freqs = comb(spacing_steps, width_steps, params)
+    rho = ctx["burn"](ctx["rho0"], freqs, ctx["trans_steps"], ctx["det"],
+                      ctx["det0"], params, ctx["pump_passes"])
+    spec = spectrum(rho, ctx["trans"], ctx["det"], ctx["f"], params,
+                    ctx=ctx["sctx"])
+    return row, spec
+
+
+def _spectrum_for(item):
+    """Worker-process wrapper for :func:`_spectrum_at`."""
+    return _spectrum_at(item, _WORKER_CTX)
 
 
 def run_scan(storage_min, storage_max, n_points,
              finesse_min, finesse_max, n_finesse,
              target_window, top_n, pump_passes,
              params=None, burn=burn_parallel,
-             parallel=True, n_workers=None,
-             progress=None, log=None, estimate=None):
+             parallel=True, n_workers=None, maxtasksperchild=None,
+             progress=None, log=None, estimate=None,
+             sim_dir=None, resume=True, checkpoint_every=10):
     """
     Sweep AFC storage time and comb finesse, scoring each spectrum by its AFC
     comb-quality score (:func:`_score_quality`) over a window at the centre -
@@ -889,10 +1147,19 @@ def run_scan(storage_min, storage_max, n_points,
     target_window     judge each spectrum over this width at the centre (MHz).
                       ``None`` -> 4 / storage_min, so the window always holds
                       several teeth however wide the spacing gets.
-    top_n             how many of the best spectra to keep for plotting
+    top_n             how many of the best spectra to keep for plotting.
+                      The sweep itself carries only scores; these spectra are
+                      recomputed in a short collect pass once the winners are
+                      known, which costs about ``top_n / unique burns`` extra
+                      time and keeps the sweep's memory flat. Clamped to the
+                      number of unique burns.
     parallel          run the sweep across a multiprocessing.Pool (default True)
     n_workers         processes to use when ``parallel`` (default one fewer than
                       os.cpu_count(), to leave the machine responsive)
+    maxtasksperchild  recycle each worker process after this many tasks
+                      (default: never). Not needed for memory (the per-worker
+                      buffers are reused, not rebuilt - see burn_parallel), but
+                      available for a very long run on a tight machine.
     progress          optional callback ``progress(done, total)``; when ``None``
                       a tqdm bar is used if stdout is a TTY
     log               optional callback ``log(str)`` for the status lines;
@@ -900,13 +1167,36 @@ def run_scan(storage_min, storage_max, n_points,
     estimate          optional callback ``estimate(seconds)`` called once with
                       the projected total run time, right after the timing
                       probe and before the sweep starts
+    sim_dir           a simulation folder to checkpoint into. ``None`` (the
+                      default) reproduces the old in-memory-only behaviour
+                      exactly. When set, every completed burn is appended to
+                      ``sim_dir/progress.csv`` as it finishes (flushed and
+                      fsynced every ``checkpoint_every`` points or 10s,
+                      whichever comes first), so a crash, a cancel, or a power
+                      loss loses at most a few seconds of work. See
+                      :func:`load_run` to read a folder back, complete or not.
+    resume            when ``sim_dir`` already holds a run: continue it,
+                      skipping burns already in ``progress.csv`` (default
+                      ``True``). ``False`` against an existing folder raises,
+                      rather than overwriting it - pick a new folder instead.
+                      A folder whose settings differ from this call (anything
+                      that changes what ``quality`` means - df, the crystal,
+                      the window, pump_passes, the burn mode, target_window, or
+                      :data:`QUALITY_VERSION`) also raises, naming the fields
+                      that changed.
+    checkpoint_every  flush/fsync progress.csv after this many completed
+                      burns, or after 10s, whichever comes first (default 10)
 
     Returns a dict with
         tag            short label for the run
-        results        one dict per requested (storage, finesse) cell:
-                       spacing_MHz, width_MHz, finesse, storage_us, quality
+        results        one dict per requested (storage, finesse) cell that was
+                       actually burned: spacing_MHz, width_MHz, finesse,
+                       storage_us, quality. A cancelled or crashed run simply
+                       omits the cells it never reached.
         best           top_n dicts by quality, each also carrying spec, f, n
         params, finesse_vals, target_window, pump_passes, metric
+        sim_dir, state, n_done, n_total, n_missing, resumed_from
+                       state is "complete", "cancelled" or "failed"
     """
     params = DEFAULT_PARAMS if params is None else params
     log = print if log is None else log
@@ -925,32 +1215,9 @@ def run_scan(storage_min, storage_max, n_points,
     finesse_vals = np.linspace(finesse_min, finesse_max, max(1, int(n_finesse)))
 
     # Tooth spacing is 1/t, quantised to the df mesh, so two close storage times
-    # can round to the same comb. Refine df by a whole factor (so it still
-    # divides the crystal levels and the window edges) until consecutive
-    # spacings are at least one step apart - bounded below by what is physically
-    # meaningful (~h_width/5) and by a cap on the spectrum array size.
-    df = df_user
-    spacings = 1.0 / t_targets
-    min_gap = (float(np.min(np.abs(np.diff(spacings)))) if len(spacings) > 1
-               else df_user)
-    if min_gap < df_user:
-        floor = min(df_user, max(1e-4, 0.2 * float(p["h_width"])))
-        floor = max(floor,
-                    (float(p["fmax"]) - float(p["fmin"])) / 2_000_000)
-        want = min(500, int(np.ceil(df_user / max(min_gap, floor))))
-        edges = np.concatenate([np.asarray(p["g"], float),
-                                np.asarray(p["e"], float),
-                                [float(p["fmin"]), float(p["fmax"])]])
-        for k in range(max(1, want), 0, -1):
-            cand = df_user / k
-            if cand < floor and k > 1:
-                continue
-            try:
-                to_steps(edges, cand)
-            except ValueError:
-                continue
-            df = cand
-            break
+    # can round to the same comb - refined by _resolve_scan_df (see there for
+    # the bounds this is subject to).
+    df, _capped_by_memory = _resolve_scan_df(t_targets, params, finesse_min)
 
     scan_params = params
     if df != df_user:
@@ -970,29 +1237,148 @@ def run_scan(storage_min, storage_max, n_points,
             todo.setdefault((s, w), len(todo))
     uniq = list(todo)       # unique (s_steps, w_steps), in first-seen order
 
+    # requested and results (below) are both fully materialised lists, one
+    # entry per (storage, finesse) cell - a caller driving run_scan directly
+    # (bypassing the GUI's own n_points/n_finesse caps) could otherwise build
+    # a many-million-entry list before the first burn even starts.
+    if len(requested) > 4_000_000:
+        raise ValueError(
+            f"n_points x n_finesse = {len(requested)} cells is too large to "
+            f"hold as a results table (limit 4,000,000) - reduce n_points "
+            f"or n_finesse")
+
+    # Open (or resume) the simulation folder, if one was given. cache is
+    # prefilled from progress.csv when resuming - the only reuse mechanism,
+    # and it is what shrinks items (below) to just the unburned cells.
+    cache = {}               # (s_steps, w_steps) -> quality
+    ckpt = None
+    if sim_dir is not None:
+        burn_spec = _burn_spec(scan_params, burn, pump_passes, target_window)
+        grid_spec = {"storage_min": storage_min, "storage_max": storage_max,
+                    "n_points": int(n_points), "finesse_min": finesse_min,
+                    "finesse_max": finesse_max, "n_finesse": int(n_finesse),
+                    "top_n": int(top_n), "df_user": float(df_user)}
+        grid = {"requested": requested, "uniq": uniq,
+                "finesse_vals": [float(v) for v in finesse_vals],
+                "t_targets": [float(v) for v in t_targets]}
+        ckpt, done = _open_run_dir(sim_dir, tag, burn_spec, grid_spec, grid,
+                                   scan_params, resume, log,
+                                   checkpoint_every=checkpoint_every)
+        cache.update(done)
+
+    # One result row per requested (storage time, finesse) cell, from the
+    # cache - built once at the top so both an early "already complete" return
+    # and the normal path share the same reconstruction (see the end of this
+    # function). Cells not yet burned (a resume, a cancel, a crash) are simply
+    # omitted rather than filled with NaN: _scan_grids/_quality_by_storage
+    # already treat a missing cell as a gap, so the scan plots work unchanged
+    # on a partial run.
+    def _build_results():
+        results = []
+        n_missing = 0
+        for t, F, s, w in requested:
+            q = cache.get((s, w))
+            if q is None:
+                n_missing += 1
+                continue
+            results.append({"spacing_MHz": s * df, "width_MHz": w * df,
+                            "finesse": F, "storage_us": t, "quality": q})
+        return results, n_missing
+
     log(f"[{tag}]  {len(t_targets)} storage times x {len(finesse_vals)} "
         f"finesse = {len(requested)} cells ({len(uniq)} unique burns)   window "
         f"{p['fmin']:g} to {p['fmax']:g} MHz, df {df:g}, judged over "
         f"{target_window:g} MHz")
     if df != df_user:
+        _refined_bytes, _ = _estimate_worker_bytes(scan_params,
+                                                   min_finesse=finesse_min)
         log(f"    refined df {df_user:g} -> {df:g} MHz so the {len(t_targets)} "
             f"requested storage times resolve to {len(distinct_spacings)} "
-            f"distinct combs (finer mesh, slower burns)")
+            f"distinct combs (finer mesh, slower burns) - "
+            f"~{_fmt_bytes(_refined_bytes)}/worker now")
     if len(distinct_spacings) < len(t_targets):
         log(f"    note: even at df {df:g} MHz only {len(distinct_spacings)} of "
             f"{len(t_targets)} storage times land on distinct combs across "
             f"{storage_min:g}-{storage_max:g} us - the rest differ by less than "
-            f"the mesh and repeat a burn")
+            + ("what a worker can hold in memory"
+               if _capped_by_memory else "the mesh")
+            + " and repeat a burn")
 
     # Built once: transition table, axes, initial rho, spectrum FFT setup.
+    # Each worker process builds its own copy in _init_worker; this one is the
+    # parent's, for the timing probe and the serial path.
     ctx = _scan_context(scan_params, burn, pump_passes, target_window)
 
-    # A single spectrum, timed, to estimate the whole sweep.
-    _t0 = time.time()
-    compute_one((0, uniq[len(uniq) // 2]), ctx=ctx)
-    _one = time.time() - _t0
-    _total = _one * len(uniq)
+    items = [(n, key) for n, key in enumerate(uniq) if key not in cache]
+    n_done0 = len(uniq) - len(items)
+    if n_done0:
+        log(f"    resuming: {n_done0} of {len(uniq)} burns already done, "
+            f"{len(items)} left")
+
+    # Every kept spectrum is recomputed after the sweep, so keeping more of
+    # them than there are burns is meaningless.
+    top_n = int(max(1, min(top_n, len(uniq))))
+    if top_n >= len(uniq):
+        log(f"    keeping every one of the {len(uniq)} spectra, so the collect "
+            f"pass re-burns the whole grid - about twice the sweep time. Lower "
+            f"'keep top N' to avoid that.")
+
+    # Pre-flight memory budget: fail fast with advice, rather than starting a
+    # sweep that swaps or gets OOM-killed part way through. n_f comes from the
+    # context already built above; the per-worker estimate uses finesse_min,
+    # the worst case for pump-array size.
+    n_f = len(ctx["f"])
+    _per_worker, _breakdown = _estimate_worker_bytes(scan_params,
+                                                     min_finesse=finesse_min)
+    _avail, _avail_src = _available_bytes()
+    _parent_estimate = _per_worker + top_n * n_f * 8 + len(requested) * 250
+    _budget = 0.6 * _avail - _parent_estimate
     _nw = n_workers or max(1, (os.cpu_count() or 1) - 1)
+    if parallel and items:
+        _fit = max(0, int(_budget // _per_worker))
+        if _fit < 1:
+            raise ValueError(
+                f"not enough memory for even one scan worker: need "
+                f"~{_fmt_bytes(_per_worker)}/worker + "
+                f"~{_fmt_bytes(_parent_estimate)} for the parent, only "
+                f"~{_fmt_bytes(_avail)} available ({_avail_src}). Coarsen df, "
+                f"narrow fmin/fmax, or raise the minimum finesse.")
+        if _fit < _nw:
+            log(f"    memory: ~{_fmt_bytes(_per_worker)}/worker "
+                f"(context {_fmt_bytes(_breakdown['context'])}, burn "
+                f"{_fmt_bytes(_breakdown['burn'])}, ffts "
+                f"{_fmt_bytes(_breakdown['spectrum'])}) + "
+                f"~{_fmt_bytes(_parent_estimate)} parent")
+            log(f"    {_fmt_bytes(_avail)} available ({_avail_src}) - budget "
+                f"{_fmt_bytes(max(0, _budget))} - workers {_nw} -> {_fit}")
+            _nw = _fit
+    _top_n_ceiling = max(1, int((0.25 * _avail) // (n_f * 8)))
+    if top_n > _top_n_ceiling:
+        log(f"    keep top N {top_n} -> {_top_n_ceiling}: retaining "
+            f"{top_n} spectra at n_f={n_f} would need more memory than is "
+            f"available ({_fmt_bytes(_avail)})")
+        top_n = _top_n_ceiling
+
+    # A single spectrum, timed, to estimate the whole run - the sweep plus the
+    # collect pass that fetches the winners' spectra afterwards. Probed from
+    # the remaining items (not the whole grid), and its result is kept rather
+    # than thrown away, so resuming an almost-finished scan does not redo a
+    # burn on every attempt.
+    if items:
+        _probe_item = items[len(items) // 2]
+        _t0 = time.time()
+        _, _probe_rec = compute_one(_probe_item, ctx=ctx, want_spec=False)
+        _one = time.time() - _t0
+        items = [it for it in items if it[0] != _probe_item[0]]
+        _pq, _pn, _psmhz, _pwmhz = _probe_rec
+        cache[uniq[_pn]] = _pq
+        if ckpt is not None:
+            _ps, _pw = uniq[_pn]
+            ckpt.append(_pn, _ps, _pw, _psmhz, _pwmhz, _pq, _one)
+    else:
+        _one = 0.0
+    _n_jobs = len(items) + top_n
+    _total = _one * _n_jobs
     if parallel:
         _total /= max(1, _nw)
     log("    about " + (f"{_total:.0f} seconds" if _total < 90
@@ -1000,22 +1386,42 @@ def run_scan(storage_min, storage_max, n_points,
     if estimate is not None:
         estimate(_total)
 
-    worker = partial(compute_one, ctx=ctx)
-    items = list(enumerate(uniq))
+    best = []                # heap of (quality, n) - keys only, no arrays
+    _key_of = {key: n for n, key in enumerate(uniq)}
 
-    cache = {}               # (s_steps, w_steps) -> quality
-    best = []                # heap of (quality, n, record_dict)
-
-    def _keep(quality, n, spec, f, s_mhz, w_mhz):
+    def _keep(key):
         import heapq
-        rec = {"quality": quality, "n": n, "spec": spec, "f": f,
-               "spacing_MHz": s_mhz, "width_MHz": w_mhz,
-               "finesse": s_mhz / w_mhz, "storage_us": 1.0 / s_mhz}
-        key = (quality, n)
         if len(best) < top_n:
-            heapq.heappush(best, (key, rec))
-        elif key > best[0][0]:
-            heapq.heappushpop(best, (key, rec))
+            heapq.heappush(best, key)
+        elif key > best[0]:
+            heapq.heappushpop(best, key)
+
+    # Seed the winners' heap from whatever is already in the cache - the
+    # resumed burns, and the probe above - so a resume's top spectra are
+    # chosen from the whole grid, not just what this call re-burns. A resumed
+    # cache can hold keys the *current* grid no longer requests at all (an
+    # old checkpoint from before n_points/finesse changed, say) - _key_of
+    # only knows this call's uniq, so anything else is simply not a
+    # candidate for best and is skipped rather than looked up.
+    for _key, _quality in cache.items():
+        _n = _key_of.get(_key)
+        if _n is not None:
+            _keep((_quality, _n))
+
+    # Cancel reaches here through the `progress` callback (the GUI's raises
+    # from inside it); this flag is how the outer try/finally below tells a
+    # cancel from a genuine failure without shb.py knowing anything about the
+    # GUI's own exception type.
+    _cancelled = [False]
+
+    def _tick(done):
+        if progress is None:
+            return
+        try:
+            progress(done, _n_jobs)
+        except BaseException:
+            _cancelled[0] = True
+            raise
 
     # Live solver status in the run log: a throttled line (roughly every 5 % of
     # the sweep, or every 15 s, whichever comes first) so a long sweep is not a
@@ -1026,14 +1432,23 @@ def run_scan(storage_min, storage_max, n_points,
     log(f"[{tag}]  sweep start - {len(items)} burns"
         + (f" across {max(1, _nw)} workers" if parallel else " (serial)"))
 
-    def _consume(i, item, result_row, record):
-        (s_steps, w_steps) = item[1]
-        s_mhz, w_mhz, quality = result_row
+    _prev_done_t = [_sweep_t0]      # for progress.csv's "seconds" column
+
+    def _consume(i, record):
+        quality, n, s_mhz, w_mhz = record
+        s_steps, w_steps = uniq[n]
         cache[(s_steps, w_steps)] = quality
-        _keep(quality, record[1], record[2], record[5], s_mhz, w_mhz)
-        if progress is not None:
-            progress(i, len(items))
+        _keep((quality, n))
         now = time.time()
+        if ckpt is not None:
+            # Wall time since the previous completion - exact in the serial
+            # path, an average per-item slice under parallelism (imap_unordered
+            # gives no per-task timer). A diagnostic column only; nothing reads
+            # it back.
+            ckpt.append(n, s_steps, w_steps, s_mhz, w_mhz, quality,
+                       now - _prev_done_t[0])
+            _prev_done_t[0] = now
+        _tick(i)
         if (i == 1 or i == len(items) or i % _log_step == 0
                 or now - _log_last[0] > 15.0):
             _log_last[0] = now
@@ -1044,54 +1459,665 @@ def run_scan(storage_min, storage_max, n_points,
             log(f"  scan {i}/{len(items)} ({100.0 * i / len(items):.0f}%) - "
                 f"{_fmt_dur(el)} elapsed, ~{_fmt_dur(eta)} left - "
                 f"last t_s {t_s:.3g}us F {fin:.1f} Q {quality:.2f}")
+            if ckpt is not None:
+                ckpt.write_status(state="running")
 
-    if parallel:
-        from multiprocessing import Pool
-        n_workers = _nw
-        chunksize = max(1, len(items) // (n_workers * 4))
-        with Pool(processes=n_workers) as pool:
-            for i, (item, (row, rec)) in enumerate(
-                    zip(items, pool.imap(worker, items, chunksize=chunksize)),
-                    start=1):
-                _consume(i, item, row, rec)
+    def _collect(pool):
+        """
+        The winners' spectra, once the sweep has picked them.
+
+        The sweep carried only scores, so this is where the kept spectra are
+        made: one contiguous (top_n, n_f) block, and one frequency axis shared
+        by every record rather than a separate unpickled copy each.
+        """
+        keys = sorted(best, reverse=True)
+        f_axis = ctx["f"]
+        specs = np.empty((len(keys), len(f_axis)))
+        jobs = [(row, uniq[n]) for row, (_, n) in enumerate(keys)]
+        log(f"[{tag}]  collecting the top {len(jobs)} spectra")
+        _t = time.time()
+        stream = (pool.imap_unordered(_spectrum_for, jobs, chunksize=1)
+                  if pool is not None
+                  else (_spectrum_at(job, ctx) for job in jobs))
+        for done, (row, spec) in enumerate(stream, start=1):
+            specs[row] = spec
+            _tick(len(items) + done)
+        log(f"[{tag}]  collect done in {_fmt_dur(time.time() - _t)}")
+
+        rows = []
+        for row, (quality, n) in enumerate(keys):
+            s_steps, w_steps = uniq[n]
+            s_mhz, w_mhz = s_steps * df, w_steps * df
+            rows.append({"quality": quality, "n": n, "spec": specs[row],
+                         "f": f_axis, "spacing_MHz": s_mhz,
+                         "width_MHz": w_mhz, "finesse": s_mhz / w_mhz,
+                         "storage_us": 1.0 / s_mhz})
+        return rows
+
+    _state = "failed"
+    _error = None
+    try:
+        if not items:
+            best_rows = _collect(None)
+        elif parallel:
+            import multiprocessing as mp
+            n_workers = _nw
+            # One item per task. The context no longer travels with the tasks,
+            # so a task is a few dozen bytes - and burns differ ~10x in cost
+            # across a finesse range, so chunking leaves whole minutes of idle
+            # workers at the tail and delays a cancel by a chunk. Tiny points
+            # still chunk, where per-task overhead would otherwise show.
+            chunksize = 1 if _one > 0.05 else 8
+            # Set, not defaulted: a GUI process has already imported numpy
+            # with a threaded BLAS by the time it gets here, but its spawned
+            # children inherit this environment and import theirs
+            # single-threaded.
+            for _var in _BLAS_THREAD_VARS:
+                os.environ[_var] = "1"
+            # Spawn, not fork: children must import numpy afresh to pick up
+            # the single-thread BLAS variables, and forking a live Qt process
+            # to copy the parent's whole heap into every worker is worth
+            # avoiding.
+            with mp.get_context("spawn").Pool(
+                    processes=n_workers, initializer=_init_worker,
+                    initargs=(scan_params, burn, pump_passes, target_window),
+                    maxtasksperchild=maxtasksperchild) as pool:
+                for i, record in enumerate(
+                        pool.imap_unordered(_run_point, items,
+                                            chunksize=chunksize), start=1):
+                    _consume(i, record)
+                log(f"[{tag}]  sweep done in "
+                    f"{_fmt_dur(time.time() - _sweep_t0)}")
+                best_rows = _collect(pool)
+        else:
+            iterator = items
+            if progress is None and sys.stdout.isatty():
+                try:
+                    from tqdm import tqdm
+                    iterator = tqdm(items, desc=f"scan {tag}", unit="spec")
+                except ImportError:
+                    pass
+            for i, item in enumerate(iterator, start=1):
+                _consume(i, compute_one(item, ctx=ctx, want_spec=False)[1])
+            log(f"[{tag}]  sweep done in {_fmt_dur(time.time() - _sweep_t0)}")
+            best_rows = _collect(None)
+        _state = "complete"
+    except BaseException as exc:
+        _state = "cancelled" if _cancelled[0] else "failed"
+        _error = None if _cancelled[0] else "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__))
+        raise
+    finally:
+        results, n_missing = _build_results()
+        if ckpt is not None:
+            if _error:
+                with open(os.path.join(sim_dir, "runlog.txt"), "a") as fh:
+                    fh.write(_error)
+            ckpt.close(state=_state, error=_error)
+
+    if n_missing:
+        log(f"    {n_missing} of {len(requested)} cells not burned "
+            f"(partial run)")
+
+    out = {"tag": tag,
+          "results": results,
+          "best": best_rows,
+          "params": scan_params,
+          "df_used": df,
+          "finesse_vals": [float(v) for v in finesse_vals],
+          "target_window": target_window,
+          "pump_passes": pump_passes,
+          "metric": "afc_quality",
+          "sim_dir": sim_dir,
+          "state": _state,
+          # Counted against the *current* uniq, not len(cache): a resume
+          # after the grid changed can leave stale keys sitting in cache that
+          # the current grid no longer requests at all (see the seeding loop
+          # above), and those should not inflate n_done past n_total.
+          "n_done": sum(1 for k in uniq if k in cache),
+          "n_total": len(uniq),
+          "n_missing": n_missing,
+          "resumed_from": n_done0}
+    if sim_dir is not None and _state == "complete":
+        try:
+            write_run_outputs(sim_dir, out)
+        except Exception as exc:                       # noqa: BLE001
+            log(f"    could not write final outputs to {sim_dir}: {exc}")
+    return out
+
+
+# ===========================================================================
+# Checkpointing - simulation folders, so a long scan survives a crash
+# ===========================================================================
+#
+# A simulation folder holds:
+#   manifest.json     written once, atomically - the resume contract (burn_spec)
+#                      plus the requested grid (grid_spec) and full params
+#   grid.json         the requested grid + unique burns, written once
+#   progress.csv      APPEND-ONLY, one row per completed burn - the checkpoint
+#   status.json       atomically replaced every ~15s - the live "how far in"
+#                      view, and (pid + heartbeat) the run's lock
+#   runlog.txt        every line the caller's `log` callback emits, timestamped
+#   results.csv, best.json, top_spectra.npy, figures/*.png   final outputs
+#
+# progress.csv is authoritative; status.json is advisory and never consulted
+# by a resume - a folder with no status.json at all (the writer died before
+# its first write) still resumes correctly from progress.csv alone.
+
+_HEARTBEAT_STALE_S = 120.0     # well above the ~15s status cadence
+
+
+def _burn_spec(params, burn, pump_passes, target_window):
+    """
+    The part of a scan's settings that changes what a checkpointed ``quality``
+    *means* for a given ``(spacing_steps, width_steps)`` key - so it is what a
+    resume must match. Everything else (which cells are requested, how many
+    workers, top_n) is bookkeeping, not physics, and lives in ``grid_spec``
+    instead.
+    """
+    p = settings(params)
+    return {
+        "quality_version": QUALITY_VERSION,
+        "df_used": float(p["df"]),
+        "g": [float(x) for x in p["g"]],
+        "e": [float(x) for x in p["e"]],
+        "dm": np.asarray(p["dm"], dtype=float).tolist(),
+        "h_width": float(p["h_width"]),
+        "in_width": float(p["in_width"]),
+        "fmin": float(p["fmin"]),
+        "fmax": float(p["fmax"]),
+        "alpha": float(p["alpha"]),
+        "pump_passes": int(pump_passes),
+        "burn": burn.__name__,
+        "target_window": float(target_window),
+    }
+
+
+def _grid_hash(burn_spec):
+    """A short, stable fingerprint of a burn_spec, for a fast resume check."""
+    text = json.dumps(burn_spec, sort_keys=True, default=_json_default)
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def _diff_burn_spec(old, new):
+    """Field-by-field differences between two burn_specs, as (field, old, new)."""
+    diffs = []
+    for key in sorted(set(old) | set(new)):
+        if old.get(key) != new.get(key):
+            diffs.append((key, old.get(key), new.get(key)))
+    return diffs
+
+
+def _atomic_write_json(path, obj):
+    """Write JSON to ``path`` via a temp file + ``os.replace``, so a reader
+    never observes a half-written file."""
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(obj, fh, indent=2, default=_json_default)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+_PROGRESS_HEADER = ("n", "s_steps", "w_steps", "spacing_MHz", "width_MHz",
+                    "quality", "seconds")
+
+
+def _read_progress(path):
+    """
+    Completed burns from an append-only ``progress.csv``, as
+    ``{(s_steps, w_steps): quality}``.
+
+    A crash between a write and its flush can leave the last line partial, or
+    - when the file was extended but the write never reached disk - a run of
+    NUL bytes. Both are handled: the final line is dropped outright unless the
+    file ends with a newline, and any remaining row with a NUL byte, the wrong
+    field count, or an unparseable number is skipped. On a duplicate key the
+    last row wins, so a point re-run after a resume overwrites its own earlier,
+    possibly-truncated line.
+    """
+    done = {}
+    if not os.path.exists(path):
+        return done
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    text = raw.decode("utf-8", errors="replace")
+    ends_clean = text.endswith("\n")
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    if lines and not ends_clean:
+        lines.pop()                              # torn final line
+    if len(lines) < 2:                           # header only, or nothing
+        return done
+    for line in lines[1:]:
+        if "\x00" in line:
+            continue
+        parts = line.split(",")
+        if len(parts) != len(_PROGRESS_HEADER):
+            continue
+        try:
+            s_steps = int(parts[1])
+            w_steps = int(parts[2])
+            quality = float(parts[5])
+        except ValueError:
+            continue
+        done[(s_steps, w_steps)] = quality
+    return done
+
+
+def _is_live(status):
+    """
+    Whether ``status`` (a loaded ``status.json``) describes a scan that is
+    genuinely still running.
+
+    ``state`` is checked first and is the deciding factor: a folder marked
+    complete/cancelled/failed is never live, even if the pid it names happens
+    to still exist (it may belong to an unrelated later process, or - inside
+    a single long-lived interpreter, such as a test driving several scans
+    back to back - to the very code now asking the question). Only when the
+    state still says "running" does the pid/heartbeat pair decide whether
+    that is real or stale: both a live pid *and* a fresh heartbeat, on this
+    host, are required, since the pid alone can be reused after a reboot and
+    a heartbeat alone cannot tell a paused writer from a dead one. That is
+    what recognises a stale "running" status - SIGKILL, an OOM kill, power
+    loss - as safe to resume.
+    """
+    if status.get("state") != "running":
+        return False
+    if status.get("host") != socket.gethostname():
+        return False
+    try:
+        pid = int(status.get("pid"))
+        os.kill(pid, 0)                          # existence check only
+    except (TypeError, ValueError, OSError):
+        return False
+    return (time.time() - float(status.get("heartbeat", 0))) < _HEARTBEAT_STALE_S
+
+
+class _Checkpoint:
+    """
+    Owns one simulation folder's on-disk state while :func:`run_scan` runs.
+
+    Call :meth:`append` after every completed burn and :meth:`close` exactly
+    once, from a ``finally``, however the sweep ends.
+    """
+
+    def __init__(self, sim_dir, resumed_from, n_total, checkpoint_every=10):
+        self.sim_dir = sim_dir
+        self.resumed_from = resumed_from
+        self.n_total = n_total
+        self._checkpoint_every = max(1, int(checkpoint_every))
+        self._fh = open(os.path.join(sim_dir, "progress.csv"), "a")
+        self._since_sync = 0
+        self._last_sync = time.time()
+        self._t0 = time.time()
+        self._n_done = resumed_from
+        self._best_quality = None
+        self._last_point = None
+
+    def append(self, n, s_steps, w_steps, s_mhz, w_mhz, quality, seconds):
+        self._fh.write(f"{n},{s_steps},{w_steps},{s_mhz!r},{w_mhz!r},"
+                       f"{quality!r},{seconds:.3f}\n")
+        self._since_sync += 1
+        self._n_done += 1
+        if self._best_quality is None or quality > self._best_quality:
+            self._best_quality = quality
+        self._last_point = {
+            "storage_us": 1.0 / s_mhz if s_mhz else None,
+            "finesse": s_mhz / w_mhz if w_mhz else None,
+            "quality": quality}
+        now = time.time()
+        # Both a count and a time bound: at a fine mesh a burn takes seconds,
+        # so an fsync per point is free and worth it; the count bound alone
+        # would make a fast, coarse scan fsync tens of times a second, and the
+        # time bound alone would lose up to 10s of a fast one. Together the
+        # loss window on a crash is whichever bound is smaller.
+        if (self._since_sync >= self._checkpoint_every
+                or now - self._last_sync > 10.0):
+            self._sync()
+            self._last_sync = now
+
+    def _sync(self):
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
+        self._since_sync = 0
+
+    def write_status(self, state="running", error=None):
+        status = {
+            "state": state, "pid": os.getpid(), "host": socket.gethostname(),
+            "started": self._t0, "heartbeat": time.time(),
+            "done": self._n_done, "total": self.n_total,
+            "resumed_from": self.resumed_from,
+            "elapsed_s": time.time() - self._t0,
+            "best_quality": self._best_quality,
+            "last": self._last_point, "error": error,
+        }
+        _atomic_write_json(os.path.join(self.sim_dir, "status.json"), status)
+
+    def close(self, state="complete", error=None):
+        self._sync()
+        self._fh.close()
+        self.write_status(state=state, error=error)
+
+
+def _open_run_dir(sim_dir, tag, burn_spec, grid_spec, grid, params, resume,
+                  log, checkpoint_every=10):
+    """
+    Open (or create) a simulation folder for :func:`run_scan`.
+
+    Returns a :class:`_Checkpoint` with ``done`` (a dict already merged into
+    the caller's ``cache``) prefilled from ``progress.csv`` when resuming.
+    Refuses - raising ``ValueError`` - a folder that is live, that mismatches
+    on ``burn_spec``, or (when ``resume`` is false) that already has a run:
+    there is no forced resume, because a forced one would silently mix two
+    physics settings into one results table and nothing downstream could tell.
+    """
+    os.makedirs(sim_dir, exist_ok=True)
+    manifest_path = os.path.join(sim_dir, "manifest.json")
+    grid_path = os.path.join(sim_dir, "grid.json")
+    grid_hash = _grid_hash(burn_spec)
+
+    if os.path.exists(manifest_path):
+        with open(manifest_path) as fh:
+            manifest = json.load(fh)
+        if manifest.get("schema_version", 1) > 1:
+            raise ValueError(
+                f"{sim_dir} was written by a newer version of shb.py "
+                f"(schema_version {manifest['schema_version']}) - cannot "
+                f"resume it here")
+
+        status_path = os.path.join(sim_dir, "status.json")
+        if os.path.exists(status_path):
+            with open(status_path) as fh:
+                status = json.load(fh)
+            if _is_live(status):
+                raise ValueError(
+                    f"{sim_dir} is being written by pid {status.get('pid')} "
+                    f"on {status.get('host')} (heartbeat "
+                    f"{time.time() - status.get('heartbeat', 0):.0f}s ago) - "
+                    f"wait for it to finish, or use a different folder")
+
+        if manifest.get("grid_hash") != grid_hash:
+            diffs = _diff_burn_spec(manifest.get("burn_spec", {}), burn_spec)
+            lines = "\n".join(f"    {k:<14} {o!r:>10} -> {n!r}"
+                              for k, o, n in diffs)
+            raise ValueError(
+                f"cannot resume {sim_dir}: it was burned with different "
+                f"settings -\n{lines}\nChange these back, or pick a new "
+                f"simulation folder.")
+
+        if not resume:
+            raise ValueError(
+                f"{sim_dir} already has a run. Pass resume=True to continue "
+                f"it, or choose a different simulation folder - a fresh run "
+                f"never overwrites an existing one.")
+
+        if manifest.get("grid_spec") != grid_spec:
+            history = manifest.setdefault("history", [])
+            history.append({"at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            "grid_spec": manifest.get("grid_spec")})
+            manifest["grid_spec"] = grid_spec
+            manifest["n_cells"] = len(grid["requested"])
+            manifest["n_unique"] = len(grid["uniq"])
+            _atomic_write_json(manifest_path, manifest)
+            _atomic_write_json(grid_path, grid)
+
+        done = _read_progress(os.path.join(sim_dir, "progress.csv"))
+        return (_Checkpoint(sim_dir, resumed_from=len(done),
+                            n_total=len(grid["uniq"]),
+                            checkpoint_every=checkpoint_every), done)
+
+    manifest = {
+        "schema_version": 1,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "tag": tag,
+        "grid_hash": grid_hash,
+        "burn_spec": burn_spec,
+        "grid_spec": grid_spec,
+        "run_spec": {"host": socket.gethostname(),
+                    "python": sys.version.split()[0], "numpy": np.__version__},
+        "n_cells": len(grid["requested"]),
+        "n_unique": len(grid["uniq"]),
+        "params": json.loads(params_to_json(params)),
+        "history": [],
+    }
+    _atomic_write_json(manifest_path, manifest)
+    _atomic_write_json(grid_path, grid)
+    with open(os.path.join(sim_dir, "progress.csv"), "w") as fh:
+        fh.write(",".join(_PROGRESS_HEADER) + "\n")
+    log(f"    new simulation folder: {sim_dir}")
+    return (_Checkpoint(sim_dir, resumed_from=0, n_total=len(grid["uniq"]),
+                       checkpoint_every=checkpoint_every), {})
+
+
+def inspect_run(sim_dir, burn_spec=None):
+    """
+    A cheap summary of a simulation folder - state, how far in it is, whether
+    it is live, and (when ``burn_spec`` is given) whether it matches this
+    call's settings. Reads ``progress.csv`` but never the spectra, so it is
+    fast enough to call on every keystroke of a GUI folder field.
+
+    Returns ``{state, n_done, n_total, live, pid, mismatch}``. ``state`` is
+    ``"new"`` when ``sim_dir`` has no manifest yet; otherwise the folder's own
+    recorded state (``running``/``cancelled``/``failed``/``complete``), with a
+    stale ``running`` corrected to whatever ``status.json`` last said before
+    the writer died. ``mismatch`` is a list of ``(field, old, new)`` from
+    :func:`_diff_burn_spec`, empty unless ``burn_spec`` was passed and differs.
+    """
+    manifest_path = os.path.join(sim_dir, "manifest.json")
+    if not os.path.isdir(sim_dir) or not os.path.exists(manifest_path):
+        return {"state": "new", "n_done": 0, "n_total": 0, "live": False,
+               "pid": None, "mismatch": []}
+    with open(manifest_path) as fh:
+        manifest = json.load(fh)
+
+    live, pid, state = False, None, "complete"
+    status_path = os.path.join(sim_dir, "status.json")
+    if os.path.exists(status_path):
+        with open(status_path) as fh:
+            status = json.load(fh)
+        live = _is_live(status)
+        pid = status.get("pid")
+        state = "running" if live else status.get("state", "unknown")
+
+    done = _read_progress(os.path.join(sim_dir, "progress.csv"))
+    # Counted against the current grid's uniq, not len(done): a folder whose
+    # grid changed (n_points widened, say) can have progress.csv rows the
+    # current grid no longer requests at all, and those should not inflate
+    # n_done past n_total.
+    n_total = manifest.get("n_unique", len(done))
+    grid_path = os.path.join(sim_dir, "grid.json")
+    if os.path.exists(grid_path):
+        with open(grid_path) as fh:
+            uniq = [tuple(k) for k in json.load(fh)["uniq"]]
+        n_done = sum(1 for k in uniq if k in done)
     else:
-        iterator = items
-        if progress is None and sys.stdout.isatty():
-            try:
-                from tqdm import tqdm
-                iterator = tqdm(items, desc=f"scan {tag}", unit="spec")
-            except ImportError:
-                pass
-        for i, item in enumerate(iterator, start=1):
-            row, rec = worker(item)
-            _consume(i, item, row, rec)
+        n_done = len(done)
+    mismatch = ([] if burn_spec is None else
+               _diff_burn_spec(manifest.get("burn_spec", {}), burn_spec))
+    return {"state": state, "n_done": n_done, "n_total": n_total,
+           "live": live, "pid": pid, "mismatch": mismatch}
 
-    log(f"[{tag}]  sweep done in {_fmt_dur(time.time() - _sweep_t0)}")
 
-    # One result row per requested (storage time, finesse) cell, from the cache.
-    # storage_us and finesse are the requested grid values (evenly spaced);
-    # spacing_MHz / width_MHz are the mesh-snapped values actually burned.
+def load_run(sim_dir):
+    """
+    Read a simulation folder back into the dict :func:`run_scan` returns.
+
+    Works on a folder in any state - complete, cancelled, failed, or one whose
+    writing process was killed outright: the completed burns are whatever
+    reached ``progress.csv``. ``results`` is rebuilt from ``grid.json``'s
+    requested grid and the completed keys, omitting any cell not yet burned -
+    the same convention :func:`run_scan` itself uses, so the scan plots need
+    no special-casing for a partial run. ``best`` comes from ``best.json`` and
+    ``top_spectra.npy`` when a collect pass has run (see :func:`collect_top`),
+    and is empty otherwise.
+    """
+    with open(os.path.join(sim_dir, "manifest.json")) as fh:
+        manifest = json.load(fh)
+    with open(os.path.join(sim_dir, "grid.json")) as fh:
+        grid = json.load(fh)
+    done = _read_progress(os.path.join(sim_dir, "progress.csv"))
+
+    params = params_from_json(json.dumps(manifest["params"]))
+    df = float(manifest["burn_spec"]["df_used"])
+
     results = []
-    for t, F, s, w in requested:
-        results.append({
-            "spacing_MHz": s * df,
-            "width_MHz": w * df,
-            "finesse": F,
-            "storage_us": t,
-            "quality": cache[(s, w)],
-        })
+    n_missing = 0
+    for t, F, s, w in grid["requested"]:
+        q = done.get((int(s), int(w)))
+        if q is None:
+            n_missing += 1
+            continue
+        results.append({"spacing_MHz": s * df, "width_MHz": w * df,
+                        "finesse": F, "storage_us": t, "quality": q})
 
-    best_rows = [rec for _, rec in sorted(best, key=lambda t: t[0],
-                                          reverse=True)]
-    return {"tag": tag,
-            "results": results,
-            "best": best_rows,
-            "params": scan_params,
-            "df_used": df,
-            "finesse_vals": [float(v) for v in finesse_vals],
-            "target_window": target_window,
-            "pump_passes": pump_passes,
-            "metric": "afc_quality"}
+    best = []
+    best_path = os.path.join(sim_dir, "best.json")
+    spec_path = os.path.join(sim_dir, "top_spectra.npy")
+    if os.path.exists(best_path) and os.path.exists(spec_path):
+        with open(best_path) as fh:
+            best_meta = json.load(fh)
+        stack = np.load(spec_path)
+        f_axis = stack[0]
+        for i, meta in enumerate(best_meta, start=1):
+            best.append({**meta, "f": f_axis, "spec": stack[i]})
+
+    state = "unknown"
+    status_path = os.path.join(sim_dir, "status.json")
+    if os.path.exists(status_path):
+        with open(status_path) as fh:
+            state = json.load(fh).get("state", "unknown")
+
+    # Counted against the current grid's uniq, not len(done): a folder whose
+    # grid changed can have progress.csv rows the current grid no longer
+    # requests at all (see the equivalent note in run_scan's own seeding
+    # loop), and those should not inflate n_done past n_total.
+    n_done = sum(1 for s, w in grid["uniq"] if (int(s), int(w)) in done)
+    return {"tag": manifest["tag"], "results": results, "best": best,
+           "params": params, "df_used": df,
+           "finesse_vals": grid["finesse_vals"],
+           "target_window": manifest["burn_spec"]["target_window"],
+           "pump_passes": manifest["burn_spec"]["pump_passes"],
+           "metric": "afc_quality", "sim_dir": sim_dir, "state": state,
+           "n_done": n_done, "n_total": len(grid["uniq"]),
+           "n_missing": n_missing, "resumed_from": n_done}
+
+
+def _write_best(sim_dir, best):
+    """
+    ``best.json`` (metadata only) + ``top_spectra.npy`` (row 0 = the shared
+    frequency axis, then one row per spectrum) - the same layout the GUI's
+    export has always written, so :func:`load_run` reads either back.
+    """
+    meta = [{k: v for k, v in r.items() if k not in ("f", "spec")}
+           for r in best]
+    _atomic_write_json(os.path.join(sim_dir, "best.json"), meta)
+    path = os.path.join(sim_dir, "top_spectra.npy")
+    if not best:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    n_f = len(best[0]["f"])
+    mm = np.lib.format.open_memmap(path, mode="w+", dtype=np.float64,
+                                   shape=(len(best) + 1, n_f))
+    mm[0] = best[0]["f"]
+    for i, r in enumerate(best, start=1):
+        mm[i] = r["spec"]
+    mm.flush()
+    del mm
+
+
+def collect_top(sim_dir, top_n=None):
+    """
+    (Re-)burn the best ``top_n`` spectra for a simulation folder from its
+    checkpointed scores, and write ``best.json`` + ``top_spectra.npy`` -
+    without re-running the sweep.
+
+    Works whether the sweep finished, was cancelled, or crashed: it only needs
+    ``progress.csv``'s scores. ``top_n`` defaults to the value recorded in the
+    folder's manifest. Returns the ``best`` list, in the same shape
+    :func:`run_scan`'s own ``best`` carries.
+    """
+    with open(os.path.join(sim_dir, "manifest.json")) as fh:
+        manifest = json.load(fh)
+    with open(os.path.join(sim_dir, "grid.json")) as fh:
+        grid = json.load(fh)
+    done = _read_progress(os.path.join(sim_dir, "progress.csv"))
+    if not done:
+        raise ValueError(f"{sim_dir} has no completed burns to collect from")
+
+    uniq = [tuple(k) for k in grid["uniq"]]
+    top_n = int(manifest["grid_spec"]["top_n"] if top_n is None else top_n)
+    top_n = max(1, min(top_n, len(done)))
+
+    params = params_from_json(json.dumps(manifest["params"]))
+    burn = (burn_series if manifest["burn_spec"]["burn"] == "burn_series"
+           else burn_parallel)
+    pump_passes = manifest["burn_spec"]["pump_passes"]
+    target_window = manifest["burn_spec"]["target_window"]
+    ctx = _scan_context(params, burn, pump_passes, target_window)
+    df = float(manifest["burn_spec"]["df_used"])
+
+    key_of = {key: n for n, key in enumerate(uniq)}
+    ranked = sorted(((q, key_of[k]) for k, q in done.items()),
+                    reverse=True)[:top_n]
+
+    best = []
+    for quality, n in ranked:
+        s_steps, w_steps = uniq[n]
+        _, spec = _spectrum_at((0, (s_steps, w_steps)), ctx)
+        s_mhz, w_mhz = s_steps * df, w_steps * df
+        best.append({"quality": quality, "n": n, "spec": spec, "f": ctx["f"],
+                     "spacing_MHz": s_mhz, "width_MHz": w_mhz,
+                     "finesse": s_mhz / w_mhz, "storage_us": 1.0 / s_mhz})
+
+    _write_best(sim_dir, best)
+    return best
+
+
+def write_run_outputs(sim_dir, scan):
+    """
+    Write a completed (or partial) scan's final outputs into its simulation
+    folder: ``results.csv``, ``best.json`` + ``top_spectra.npy`` (see
+    :func:`_write_best`), and the three scan figures under ``figures/``.
+
+    Called by :func:`run_scan` itself once a sweep with a ``sim_dir``
+    completes, and usable standalone to re-export a folder (a different
+    ``top_n`` via :func:`collect_top` first, say) without recomputing anything.
+    """
+    os.makedirs(sim_dir, exist_ok=True)
+    cols = ["spacing_MHz", "width_MHz", "finesse", "storage_us", "quality"]
+    with open(os.path.join(sim_dir, "results.csv"), "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=cols)
+        w.writeheader()
+        w.writerows(scan["results"])
+
+    _write_best(sim_dir, scan["best"])
+
+    fig_dir = os.path.join(sim_dir, "figures")
+    os.makedirs(fig_dir, exist_ok=True)
+    from matplotlib.figure import Figure
+    fig = Figure(figsize=(8, 4), constrained_layout=True)
+    for name, fn in (("heatmap", plot_scan_heatmap),
+                     ("quality_vs_storage", plot_scan_max),
+                     ("topspectra", plot_top_spectra)):
+        fig.clear()
+        try:
+            # A very partial run (a handful of cells, or none kept yet) can
+            # leave too little for one of these to draw - skip that figure
+            # rather than fail the whole export over it.
+            fn(fig.add_subplot(111), scan)
+            fig.savefig(os.path.join(fig_dir, f"{name}.png"), dpi=200)
+        except Exception:                              # noqa: BLE001
+            pass
+    del fig
 
 
 # ===========================================================================
@@ -1379,10 +2405,11 @@ def plot_top_spectra_plotly(scan):
 
 
 # ===========================================================================
-# CLI smoke test
+# CLI
 # ===========================================================================
 
-def _main():
+def _smoke():
+    """The original CLI check: burn one comb and print a short summary."""
     params = _default_params()
     validate_params(params)
 
@@ -1404,6 +2431,126 @@ def _main():
     print(f"Absorption {spec.min():.2f} to {spec.max():.2f}  "
           f"(dAbsorption {spec.max() - spec.min():.2f}, "
           f"unburned {settings(params)['alpha']:.2f})")
+
+
+def _cli_load_config(path):
+    """
+    A params dict from either a plain ``params_to_json`` file or a GUI
+    ``..._config.json`` session export (``{"params": ..., "gui": ...}``).
+    """
+    with open(path) as fh:
+        data = json.load(fh)
+    if isinstance(data, dict) and "params" in data and "crystal_params" not in data:
+        data = data["params"]
+    return params_from_json(json.dumps(data))
+
+
+def _cli_scan(args):
+    # Imported by name rather than used as the running __main__ module, so
+    # that everything the Pool pickles (compute_one, _init_worker, ...)
+    # carries the "shb" qualname a spawned child can always resolve, the same
+    # as when this file is used as a library rather than run directly.
+    import shb as _shb
+
+    if args.config:
+        params = _cli_load_config(args.config)
+    elif args.preset:
+        params = copy.deepcopy(_shb.PRESETS[args.preset])
+    else:
+        params = copy.deepcopy(_shb.DEFAULT_PARAMS)
+
+    pump_passes = (args.pump_passes if args.pump_passes is not None
+                  else _shb.settings(params)["pump_passes"])
+    burn = _shb.burn_series if args.burn == "series" else _shb.burn_parallel
+
+    scan = _shb.run_scan(
+        args.storage_min, args.storage_max, args.n_points,
+        args.finesse_min, args.finesse_max, args.n_finesse,
+        args.target_window, args.top_n, pump_passes,
+        params=params, burn=burn, parallel=not args.serial,
+        n_workers=args.workers, sim_dir=args.sim_dir, resume=args.resume,
+        checkpoint_every=args.checkpoint_every)
+    print(f"[{scan['tag']}] {scan['state']}: {scan['n_done']}/{scan['n_total']} "
+         f"burns, {len(scan['results'])} results, {len(scan['best'])} kept "
+         f"-> {args.sim_dir}")
+
+
+def _cli_collect(args):
+    import shb as _shb
+    best = _shb.collect_top(args.sim_dir, top_n=args.top_n)
+    scan = _shb.load_run(args.sim_dir)
+    _shb.write_run_outputs(args.sim_dir, scan)
+    print(f"collected {len(best)} spectra, wrote results.csv / best.json / "
+         f"top_spectra.npy / figures/ to {args.sim_dir}")
+
+
+def _cli_status(args):
+    import shb as _shb
+    info = _shb.inspect_run(args.sim_dir)
+    live = f" (live, pid {info['pid']})" if info["live"] else ""
+    print(f"{args.sim_dir}: {info['state']}{live}  "
+         f"{info['n_done']}/{info['n_total']} burns done")
+
+
+def _main(argv=None):
+    """
+    Command line entry point.
+
+    With no subcommand this runs the original single-burn smoke test. The
+    subcommands exist so a long sweep can run outside the GUI, checkpointing
+    to a simulation folder, and be resumed after a crash::
+
+        python shb.py scan --sim-dir runs/afc1 --storage-min 2 --storage-max 10 \\
+            --n-points 40 --finesse-min 2 --finesse-max 20 --n-finesse 20
+        python shb.py scan --sim-dir runs/afc1          # resumes by default
+        python shb.py collect --sim-dir runs/afc1
+        python shb.py status  --sim-dir runs/afc1
+    """
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv or argv[0] not in ("scan", "collect", "status"):
+        return _smoke()
+
+    import argparse
+    parser = argparse.ArgumentParser(prog="shb.py")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sc = sub.add_parser("scan", help="run (or resume) a storage/finesse sweep")
+    sc.add_argument("--sim-dir", required=True)
+    sc.add_argument("--storage-min", type=float, required=True)
+    sc.add_argument("--storage-max", type=float, required=True)
+    sc.add_argument("--n-points", type=int, required=True)
+    sc.add_argument("--finesse-min", type=float, required=True)
+    sc.add_argument("--finesse-max", type=float, required=True)
+    sc.add_argument("--n-finesse", type=int, required=True)
+    sc.add_argument("--target-window", type=float, default=None)
+    sc.add_argument("--top-n", type=int, default=50)
+    sc.add_argument("--pump-passes", type=int, default=None,
+                    help="default: whatever the params/preset carries")
+    sc.add_argument("--burn", choices=("parallel", "series"), default="parallel")
+    sc.add_argument("--serial", action="store_true",
+                    help="disable multiprocessing")
+    sc.add_argument("--workers", type=int, default=None)
+    sc.add_argument("--checkpoint-every", type=int, default=10)
+    sc.add_argument("--resume", dest="resume", action="store_true",
+                    default=True, help="resume sim-dir if it already exists "
+                    "(default)")
+    sc.add_argument("--no-resume", dest="resume", action="store_false")
+    sc.add_argument("--preset", default=None, choices=sorted(PRESETS))
+    sc.add_argument("--config", default=None,
+                    help="a params or GUI config.json file; overrides --preset")
+
+    co = sub.add_parser("collect",
+                        help="(re-)collect the top spectra from a run's "
+                        "checkpoint, without re-sweeping")
+    co.add_argument("--sim-dir", required=True)
+    co.add_argument("--top-n", type=int, default=None)
+
+    st = sub.add_parser("status", help="how far a simulation folder has got")
+    st.add_argument("--sim-dir", required=True)
+
+    ns = parser.parse_args(argv)
+    {"scan": _cli_scan, "collect": _cli_collect,
+     "status": _cli_status}[ns.cmd](ns)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ the run log streams the same lines the module would otherwise print.
 
 from __future__ import annotations
 
+import copy
 import csv
 import json
 import os
@@ -162,10 +163,30 @@ class SimWorker(QObject):
             self.scan_done.emit(scan)
         except _Cancelled:
             self.log.emit("scan cancelled")
+            self._emit_partial(kwargs.get("sim_dir"))
         except Exception as exc:                       # noqa: BLE001
             self.error.emit(str(exc))
+            self._emit_partial(kwargs.get("sim_dir"))
         finally:
             self.busy.emit(False)
+
+    def _emit_partial(self, sim_dir):
+        """
+        After a cancelled or failed scan, load back whatever the checkpoint
+        kept - the same run_scan.close()/write_run_outputs path a resume
+        starts from, so what the user sees here is exactly that, not a
+        second, differently-built reconstruction.
+        """
+        if not sim_dir:
+            return
+        try:
+            scan = shb.load_run(sim_dir)
+        except Exception as exc:                       # noqa: BLE001
+            self.log.emit(f"could not read partial run from {sim_dir}: {exc}")
+            return
+        self.log.emit(f"partial results kept: {scan['n_done']} of "
+                      f"{scan['n_total']} burns in {sim_dir}")
+        self.scan_done.emit(scan)
 
 
 class _Cancelled(Exception):
@@ -296,14 +317,17 @@ class StackedPlot(QWidget):
             return
         ax = self._axes[-1]
         x0, x1 = sorted(ax.get_xlim())
+        # Every top-spectra line shares one frequency axis (shb.run_scan hands
+        # out a single f array, not a copy per spectrum), so the x-range mask
+        # is the same for all of them - compute it once instead of per line.
+        xd = np.asarray(self._top_lines[0].get_xdata(), dtype=float)
+        m = (xd >= x0) & (xd <= x1)
         lo, hi = np.inf, -np.inf
-        for ln in self._top_lines:
-            if not ln.get_visible():
-                continue
-            xd = np.asarray(ln.get_xdata(), dtype=float)
-            yd = np.asarray(ln.get_ydata(), dtype=float)
-            m = (xd >= x0) & (xd <= x1)
-            if m.any():
+        if m.any():
+            for ln in self._top_lines:
+                if not ln.get_visible():
+                    continue
+                yd = np.asarray(ln.get_ydata(), dtype=float)
                 lo = min(lo, float(np.nanmin(yd[m])))
                 hi = max(hi, float(np.nanmax(yd[m])))
         if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
@@ -519,6 +543,10 @@ class MainWindow(QMainWindow):
         self._job_t0 = 0.0
         self._job_estimate = None       # seconds, from run_scan's probe
         self._job_kind = None           # "burn" | "scan" | "norm" | None
+        self._progress_base = None      # first "done" seen this job, for a
+                                        # resumed scan's ETA (see _on_progress)
+        self._sim_root = None           # remembered parent for auto-named
+                                        # simulation folders
 
         self._build_menu()
         self._build_body()
@@ -546,6 +574,7 @@ class MainWindow(QMainWindow):
         assert file_menu is not None
         for text, slot in [
             ("Import config (.json)...", self._import_config),
+            ("Open run folder...", self._open_run_folder),
             ("Export...", self._open_export),
         ]:
             act = QAction(text, self)
@@ -598,6 +627,14 @@ class MainWindow(QMainWindow):
         self.scan_view.setEnabled(False)
         self.scan_view.currentIndexChanged.connect(self._draw_feature)
         row.addWidget(self.scan_view)
+        self.collect_btn = QPushButton("Collect top spectra")
+        self.collect_btn.setToolTip(
+            "Re-burn the best spectra from this run's checkpoint - for a "
+            "cancelled run that never reached the collect pass, or to redo "
+            "it at a different 'keep top N' without resweeping.")
+        self.collect_btn.setEnabled(False)
+        self.collect_btn.clicked.connect(self._on_collect_top_clicked)
+        row.addWidget(self.collect_btn)
         row.addStretch(1)
         row.addWidget(QLabel("(drag to zoom the x-axis · "
                              "double-click or Home to reset)"))
@@ -714,10 +751,14 @@ class MainWindow(QMainWindow):
         sc_form = QFormLayout(sc)
         self.storage_min = _dspin(0.001, 100000, 0.5, 3, 2.0)
         self.storage_max = _dspin(0.001, 100000, 0.5, 3, 10.0)
-        self.n_points = _ispin(2, 1000000, 40)
+        # Capped well below the field's old 1,000,000: `requested` and
+        # `results` (shb.run_scan) are both fully materialised lists sized
+        # n_points x n_finesse, and a heatmap beyond a couple of thousand
+        # cells per axis already exceeds screen resolution.
+        self.n_points = _ispin(2, 2000, 40)
         self.finesse_min = _dspin(1.0, 1000, 0.5, 2, 2.0)
         self.finesse_max = _dspin(1.0, 1000, 0.5, 2, 20.0)
-        self.n_finesse = _ispin(1, 1000000, 20)
+        self.n_finesse = _ispin(1, 2000, 20)
         self.target_window = _dspin(0.1, 10000, 1.0, 3, 20.0)
         self.top_n = _ispin(1, 5000, 50)
         self.parallel_check = QCheckBox("multiprocessing")
@@ -739,6 +780,25 @@ class MainWindow(QMainWindow):
         sc_form.addRow("keep top N", self.top_n)
         sc_form.addRow(self.parallel_check)
         sc_form.addRow(f"workers (of {_cpu})", self.workers)
+
+        self.sim_dir = QLineEdit()
+        self.sim_dir.setPlaceholderText(
+            "(auto-named under a folder you choose)")
+        self.sim_dir.textChanged.connect(self._refresh_sim_dir_state)
+        sim_browse = QPushButton("Browse...")
+        sim_browse.clicked.connect(self._pick_sim_dir)
+        sim_row = QHBoxLayout()
+        sim_row.addWidget(self.sim_dir, stretch=1)
+        sim_row.addWidget(sim_browse)
+        sc_form.addRow("simulation folder", sim_row)
+        self.sim_resume = QCheckBox("resume if the folder already has a run")
+        self.sim_resume.setChecked(True)
+        sc_form.addRow(self.sim_resume)
+        self.sim_dir_info = QLabel("new run - continuously checkpointed, so "
+                                   "a crash or cancel keeps what finished")
+        self.sim_dir_info.setWordWrap(True)
+        self.sim_dir_info.setStyleSheet("color: gray")
+        sc_form.addRow(self.sim_dir_info)
         self.stack.addWidget(sc)
 
         outer.addWidget(self.stack)
@@ -889,6 +949,8 @@ class MainWindow(QMainWindow):
     def _on_mode_changed(self, idx):
         self.stack.setCurrentIndex(idx)
         self._refresh_comb_preview()
+        if idx == 2:
+            self._refresh_sim_dir_state()
 
     def _current_pump_freqs(self, params):
         mode = self.mode_combo.currentIndex()
@@ -927,9 +989,28 @@ class MainWindow(QMainWindow):
     # -- run ----------------------------------------------------------
 
     def _on_run_clicked(self):
-        if self.run_btn.text() == "Cancel":
+        # Gated on job state, not the button's text: once the button can also
+        # read "Resume (612/800)" or "Open", comparing against a literal
+        # "Cancel" string breaks.
+        if self._job_kind is not None:
             self.worker.cancel()
             return
+
+        if self.mode_combo.currentIndex() == 2 and self.run_btn.text() == "Open":
+            # A completed folder: load it back for plotting rather than
+            # recomputing anything - the button reads "Open" only when
+            # inspect_run() has already confirmed every burn is done.
+            sim_dir = self.sim_dir.text().strip() or self._auto_sim_dir()
+            try:
+                scan = shb.load_run(sim_dir)
+            except Exception as exc:                    # noqa: BLE001
+                self._on_error(str(exc))
+                return
+            self._append_log(f"opened {sim_dir}: {scan['state']}, "
+                             f"{scan['n_done']}/{scan['n_total']} burns")
+            self._on_scan_done(scan)
+            return
+
         try:
             params = self._collect_params()
             shb.validate_params(params)
@@ -939,8 +1020,19 @@ class MainWindow(QMainWindow):
 
         self._job_t0 = time.monotonic()
         self._job_estimate = None
+        self._progress_base = None
+
+        # Drop the previous run's spectra before starting a new one, rather
+        # than waiting for the new scan_done/burn_done to overwrite them: the
+        # old top-N spectra otherwise stay pinned in the live axes (and in
+        # self._scan) for the whole new run, doubling the retained set.
+        self._scan = None
+        self._last_burn = None
+        self.plot.show_message("running...")
+        self._refresh_export_enabled()
 
         if self.mode_combo.currentIndex() == 2:
+            sim_dir = self._resolved_sim_dir()
             kwargs = dict(
                 storage_min=self.storage_min.value(),
                 storage_max=self.storage_max.value(),
@@ -955,9 +1047,13 @@ class MainWindow(QMainWindow):
                       else shb.burn_parallel),
                 parallel=self.parallel_check.isChecked(),
                 n_workers=self.workers.value(),
+                sim_dir=sim_dir,
+                resume=self.sim_resume.isChecked(),
             )
             self._job_kind = "scan"
-            self._append_log("--- scan ---")
+            self._append_log(f"--- scan --- {sim_dir}")
+            self.sim_dir.setText(sim_dir)
+            self._write_sim_dir_config(sim_dir, params)
             self.request_scan.emit(params, kwargs)
         else:
             freqs, summary = self._current_pump_freqs(params)
@@ -970,7 +1066,8 @@ class MainWindow(QMainWindow):
     # -- worker callbacks -------------------------------------------
 
     def _on_busy(self, busy):
-        self.run_btn.setText("Cancel" if busy else "Run")
+        if busy:
+            self.run_btn.setText("Cancel")
         for w in (self.mode_combo, self.df, self.fmin, self.fmax):
             w.setEnabled(not busy)
         if busy:
@@ -985,6 +1082,11 @@ class MainWindow(QMainWindow):
             self.progress.setRange(0, 1)
             self.progress.setValue(1)
             self.progress.setFormat("done")
+            # Restores the Run/Resume/Open label from the folder's own state,
+            # rather than a blanket "Run" - a completed scan sitting in a
+            # simulation folder should offer Resume/Open on the next look,
+            # not silently revert to a plain Run.
+            self._refresh_sim_dir_state()
 
     def _on_estimate(self, secs):
         self._job_estimate = secs
@@ -999,12 +1101,19 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, total)
         self.progress.setValue(done)
         elapsed = time.monotonic() - self._job_t0
-        if done:
-            eta = elapsed / done * (total - done)
+        # A resumed scan starts this job's progress at done = (say) 612 while
+        # elapsed is still ~0, so elapsed/done*(total-done) reports an ETA of
+        # nearly nothing for the whole run. Track where *this* job's progress
+        # started and use only the work done since then.
+        if self._progress_base is None:
+            self._progress_base = done
+        did = done - self._progress_base
+        if did > 0:
+            eta = elapsed / did * (total - done)
             self.progress.setFormat(
                 f"%p%  ·  {done}/{total}  ·  ~{fmt_dur(eta)} left")
         else:
-            self.progress.setFormat(f"0/{total}")
+            self.progress.setFormat(f"{done}/{total}")
 
     def _tick_progress_text(self):
         """Live elapsed/ETA text while a job runs (driven by a 0.5 s timer)."""
@@ -1022,6 +1131,7 @@ class MainWindow(QMainWindow):
         self._last_burn = out
         self._scan = None
         self.scan_view.setEnabled(False)
+        self.collect_btn.setEnabled(False)
         self._draw_feature()
         self._refresh_export_enabled()
 
@@ -1029,8 +1139,17 @@ class MainWindow(QMainWindow):
         self._scan = scan
         self._last_burn = None
         self.scan_view.setEnabled(True)
+        # A cancelled or crashed run can have completed burns but no top
+        # spectra yet (the collect pass never ran) - offer to fetch them from
+        # the checkpoint instead of resweeping.
+        self.collect_btn.setEnabled(
+            bool(scan.get("sim_dir")) and not scan["best"]
+            and scan.get("n_done", 0) > 0)
+        if not scan["best"] and self.scan_view.currentIndex() == 2:
+            self.scan_view.setCurrentIndex(0)
         self._draw_feature()
         self._refresh_export_enabled()
+        self._refresh_sim_dir_state()
 
     def _on_error(self, msg):
         self._append_log(f"ERROR: {msg}")
@@ -1136,10 +1255,165 @@ class MainWindow(QMainWindow):
         except Exception as exc:                       # noqa: BLE001
             self._on_error(str(exc))
 
+    # -- simulation folder -------------------------------------------
+
+    def _auto_sim_dir(self):
+        """A fresh run-folder name under the remembered root: sim_<tag>_df<df>_<timestamp>."""
+        root = self._sim_root or os.getcwd()
+        tag = f"{self.storage_min.value():g}-{self.storage_max.value():g}us"
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        return os.path.join(root, f"sim_{tag}_df{self.df.value():g}_{stamp}")
+
+    def _resolved_sim_dir(self):
+        """
+        The simulation folder for the next Run/Resume click - the field's
+        text if the user set one, otherwise a fresh auto-named folder. The
+        timestamp is resolved here, at Run, not whenever the field happened
+        to last be blank.
+        """
+        text = self.sim_dir.text().strip()
+        return text if text else self._auto_sim_dir()
+
+    def _pick_sim_dir(self):
+        start = self._sim_root or os.getcwd()
+        folder = QFileDialog.getExistingDirectory(
+            self, "Simulation folder", start)
+        if not folder:
+            return
+        if os.path.exists(os.path.join(folder, "manifest.json")):
+            # Picked an existing run directly - use it as-is, to resume it.
+            self.sim_dir.setText(folder)
+            self._sim_root = os.path.dirname(folder) or folder
+        else:
+            # Picked a plain folder - treat it as the root, auto-name inside.
+            self._sim_root = folder
+            self.sim_dir.setText(self._auto_sim_dir())
+
+    def _write_sim_dir_config(self, sim_dir, params):
+        """Best-effort config.json alongside the checkpoint, so File > Open
+        run folder can restore the GUI session, not just the numbers."""
+        try:
+            os.makedirs(sim_dir, exist_ok=True)
+            with open(os.path.join(sim_dir, "config.json"), "w") as fh:
+                json.dump(self._collect_session(), fh, indent=2,
+                          default=shb._json_default)
+        except OSError as exc:                          # noqa: BLE001
+            self._append_log(f"! could not write config.json: {exc}")
+
+    def _refresh_sim_dir_state(self, *_):
+        """
+        Update the folder hint label and the Run button's label from what is
+        actually on disk - new / resumable / complete / live / mismatched -
+        so the button never has to be taken on faith.
+        """
+        if self.mode_combo.currentIndex() != 2:
+            return
+        busy = self._job_kind is not None
+        path = self.sim_dir.text().strip() or self._auto_sim_dir()
+        try:
+            params = self._collect_params()
+            burn = (shb.burn_series if self.burn_mode.currentText() == "series"
+                   else shb.burn_parallel)
+            # df can auto-refine inside run_scan (shb._resolve_scan_df) when
+            # storage times land close together on the mesh; the manifest
+            # records that *refined* df_used, so comparing against the raw
+            # df spinbox value here would report a mismatch against a folder
+            # burned with these exact settings the moment refinement kicks
+            # in. Resolve it the same way run_scan will before comparing.
+            t_targets = np.linspace(self.storage_min.value(),
+                                    self.storage_max.value(),
+                                    max(2, self.n_points.value()))
+            df, _ = shb._resolve_scan_df(t_targets, params,
+                                         self.finesse_min.value())
+            if df != shb.settings(params)["df"]:
+                params = copy.deepcopy(params)
+                params["numerical_params"]["df"] = df
+            burn_spec = shb._burn_spec(params, burn, self.pump_passes.value(),
+                                       self.target_window.value())
+            info = shb.inspect_run(path, burn_spec=burn_spec)
+        except Exception:                               # noqa: BLE001
+            info = {"state": "new", "n_done": 0, "n_total": 0, "live": False,
+                    "pid": None, "mismatch": []}
+
+        label, colour = "Run", "gray"
+        if info["state"] == "new":
+            text = ("new run - continuously checkpointed, so a crash or "
+                    "cancel keeps what finished")
+        elif info["live"]:
+            text = (f"in use by pid {info['pid']} - wait for it to finish, "
+                    f"or choose another folder")
+            colour = "#b00"
+        elif info["mismatch"]:
+            fields = ", ".join(f for f, _, _ in info["mismatch"])
+            text = (f"different settings ({fields}) - Run will refuse to "
+                    f"resume this folder; pick a new one")
+            colour = "#b00"
+        elif info["n_total"] and info["n_done"] >= info["n_total"]:
+            text = f"complete - {info['n_done']}/{info['n_total']} burns done"
+            label = "Open"
+        elif info["n_done"] > 0:
+            text = (f"resume: {info['n_done']} of {info['n_total']} burns "
+                    f"already done")
+            label = f"Resume ({info['n_done']}/{info['n_total']})"
+        else:
+            text = "new run"
+
+        self.sim_dir_info.setText(text)
+        self.sim_dir_info.setStyleSheet(f"color: {colour}")
+        if not busy:
+            self.run_btn.setText(label)
+            self.run_btn.setEnabled(not info["live"])
+
+    def _on_collect_top_clicked(self):
+        if self._scan is None or not self._scan.get("sim_dir"):
+            return
+        sim_dir = self._scan["sim_dir"]
+        try:
+            shb.collect_top(sim_dir, top_n=self.top_n.value())
+            scan = shb.load_run(sim_dir)
+        except Exception as exc:                        # noqa: BLE001
+            self._on_error(str(exc))
+            return
+        self._append_log(f"collected {len(scan['best'])} top spectra from "
+                         f"{sim_dir}")
+        self._on_scan_done(scan)
+
+    def _open_run_folder(self):
+        path = QFileDialog.getExistingDirectory(
+            self, "Open a simulation folder", self._sim_root or os.getcwd())
+        if not path:
+            return
+        try:
+            scan = shb.load_run(path)
+        except Exception as exc:                        # noqa: BLE001
+            self._on_error(f"could not read {path}: {exc}")
+            return
+        cfg_path = os.path.join(path, "config.json")
+        if os.path.exists(cfg_path):
+            try:
+                with open(cfg_path) as fh:
+                    self._apply_session(json.load(fh))
+            except Exception as exc:                     # noqa: BLE001
+                self._append_log(f"! could not restore session: {exc}")
+        self.mode_combo.setCurrentIndex(2)
+        self.sim_dir.setText(path)
+        self._sim_root = os.path.dirname(path) or path
+        self._append_log(f"opened {path}: {scan['state']}, "
+                         f"{scan['n_done']}/{scan['n_total']} burns")
+        self._on_scan_done(scan)
+
     def _refresh_export_enabled(self):
         have = self._last_burn is not None or self._scan is not None
         self.exp_btn.setEnabled(have)
-        self.exp_hint.setText("" if have else "Run a simulation first.")
+        sim_dir = self._scan.get("sim_dir") if self._scan else None
+        if sim_dir:
+            # A checkpointed scan already has results.csv, best.json,
+            # top_spectra.npy and figures/ written into sim_dir as it ran (or
+            # completed) - export here is for a differently-named copy
+            # elsewhere, not the only way to get the data out.
+            self.exp_hint.setText(f"already saved in {sim_dir}")
+        else:
+            self.exp_hint.setText("" if have else "Run a simulation first.")
         if have:
             self.exp_prefix.setText(self._auto_prefix())
 
@@ -1158,7 +1432,9 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Export",
                                    "Run a simulation before exporting.")
             return
-        folder = QFileDialog.getExistingDirectory(self, "Export to folder")
+        start = (self._scan.get("sim_dir") if self._scan else None) or ""
+        folder = QFileDialog.getExistingDirectory(
+            self, "Export to folder", start)
         if not folder:
             return
         try:
@@ -1197,13 +1473,24 @@ class MainWindow(QMainWindow):
             self.plot.figure.savefig(f"{base}_plot.png", dpi=300)
             note(f"{base}_plot.png")
             if self._scan is not None:
+                # One Figure, cleared between views, rather than a fresh one
+                # per view: at 300 dpi the Agg backend builds transformed path
+                # arrays proportional to n_f for every line, ~80 MB per figure
+                # at df 0.001 (and this scan already has its own top-N traces
+                # live in self.plot's canvas). Reusing the Figure means only
+                # one of those buffers exists at a time, and dropping it with
+                # `del` at the end - rather than letting it go out of scope
+                # at the end of the loop's next iteration - releases it
+                # immediately rather than at the next figure's construction.
+                fig = Figure(figsize=(8, 4), constrained_layout=True)
                 for name, fn in (("heatmap", shb.plot_scan_heatmap),
                                  ("quality_vs_storage", shb.plot_scan_max),
                                  ("topspectra", shb.plot_top_spectra)):
-                    fig = Figure(figsize=(8, 4), constrained_layout=True)
+                    fig.clear()
                     fn(fig.add_subplot(111), self._scan)
                     fig.savefig(f"{base}_{name}.png", dpi=300)
                     note(f"{base}_{name}.png")
+                del fig
 
         if self.exp_data.isChecked():
             if self._scan is not None:
@@ -1217,9 +1504,21 @@ class MainWindow(QMainWindow):
                 note(path)
                 best = self._scan["best"]
                 if best:
-                    stack = np.vstack([best[0]["f"]]
-                                      + [r["spec"] for r in best])
-                    np.save(f"{base}_top_spectra.npy", stack)
+                    # Written row by row into a memory-mapped .npy rather than
+                    # np.vstack-ed first: vstack would allocate a second
+                    # (top_n + 1, n_f) block on top of the spectra already
+                    # retained in self._scan - 8 GB on top of 8 GB at the GUI's
+                    # top_n maximum of 5000. The saved file is byte-identical;
+                    # only the peak while writing it changes.
+                    n_f = len(best[0]["f"])
+                    mm = np.lib.format.open_memmap(
+                        f"{base}_top_spectra.npy", mode="w+",
+                        dtype=np.float64, shape=(len(best) + 1, n_f))
+                    mm[0] = best[0]["f"]
+                    for i, r in enumerate(best, start=1):
+                        mm[i] = r["spec"]
+                    mm.flush()
+                    del mm
                     note(f"{base}_top_spectra.npy")
                 with open(f"{base}_scan.pkl", "wb") as fh:
                     pickle.dump(self._scan, fh)

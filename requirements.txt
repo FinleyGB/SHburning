@@ -4,3 +4,4 @@ matplotlib
 plotly
 tqdm
 PyQt6
+# psutil    # optional: sharpens run_scan's memory budget from total RAM to available

@@ -104,8 +104,38 @@ Three ways to use it, mirrored by the GUI's **mode** selector:
    logged. A finer mesh means slower burns - the up-front time estimate reflects
    it.
    Runs on a `multiprocessing.Pool` **by default** (`parallel=True`,
-   `n_workers=os.cpu_count()`; GUI: the *multiprocessing* checkbox, now ticked by
-   default); pass `parallel=False` for a single-process sweep.
+   `n_workers=os.cpu_count() - 1`, so the machine stays responsive; GUI: the
+   *multiprocessing* checkbox, ticked by default); pass `parallel=False` for a
+   single-process sweep. Each point in the sweep returns only its score, not
+   its spectrum - the top-N spectra are re-burned in a short collect pass once
+   the winners are known, so a long sweep's memory stays flat rather than
+   growing with the grid. A pre-flight check estimates the memory a worker
+   needs and clamps `n_workers`/`top_n` (or refuses to start, with a specific
+   fix to try) rather than letting the sweep swap or get OOM-killed.
+
+### Simulation folders (checkpoint / resume)
+
+Pass `sim_dir=` to `run_scan` (in the GUI: the *simulation folder* field on the
+Scan page, auto-named under a root you pick once) and every completed burn is
+appended to `sim_dir/progress.csv` as it finishes - flushed and fsynced every
+few points or ten seconds, whichever comes first. A crash, a `Cancel`, or a
+power loss then loses at most a few seconds of work, not the whole run: opening
+the same folder again (`resume=True`, the default) picks up only the unburned
+cells. The folder also carries `manifest.json` (the settings a resume is
+checked against - `df_used`, the crystal, the window, pump passes, the burn
+mode - refused with a diff if they no longer match), `status.json` (a live
+"how far in" view, and the run's lock - two processes cannot write the same
+folder at once), and, once a sweep finishes, `results.csv`, `best.json` +
+`top_spectra.npy` and `figures/*.png`. `shb.load_run(sim_dir)` reads a folder
+back - complete, cancelled, or crashed - into the same dict `run_scan` returns;
+`shb.inspect_run(sim_dir)` is a cheap summary for a GUI to poll;
+`shb.collect_top(sim_dir)` (re-)burns the top spectra from the checkpoint alone,
+without resweeping.
+
+A long scan does not need the GUI open: `python shb.py scan --sim-dir ... `
+runs headless, `--resume` (the default) continues an interrupted one, and
+`python shb.py status --sim-dir ...` / `collect --sim-dir ...` check on or
+finish a run from the checkpoint. See `python shb.py scan --help`.
 
 ### The `df` rule
 
