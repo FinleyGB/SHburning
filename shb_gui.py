@@ -505,6 +505,13 @@ class LevelsDialog(QDialog):
 
         self.g_table = self._vector_table(g)
         self.e_table = self._vector_table(e)
+        self.g_info = QLabel()
+        self.e_info = QLabel()
+        for lbl in (self.g_info, self.e_info):
+            lbl.setStyleSheet("color: grey;")
+            lbl.setWordWrap(True)
+        self.g_table.itemChanged.connect(self._update_level_info)
+        self.e_table.itemChanged.connect(self._update_level_info)
         self.dm_table = QTableWidget(dm.shape[0], dm.shape[1])
         self.dm_table.setHorizontalHeaderLabels(
             [f"e{m}" for m in range(dm.shape[1])])
@@ -523,11 +530,41 @@ class LevelsDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel("Ground levels g"))
         lay.addWidget(self.g_table)
+        lay.addWidget(self.g_info)
         lay.addWidget(QLabel("Excited levels e"))
         lay.addWidget(self.e_table)
+        lay.addWidget(self.e_info)
         lay.addWidget(QLabel("Branching / relative dipole matrix dm"))
         lay.addWidget(self.dm_table)
         lay.addWidget(buttons)
+
+        self._update_level_info()
+
+    @staticmethod
+    def _describe_levels(table):
+        """
+        Level count, span and consecutive spacing for one row of a levels
+        table - the numbers default_pit_width and anti_hole_pumps (shb.py)
+        actually work from, so this is what matters when editing g or e, not
+        just the raw energies.
+        """
+        vals = []
+        for i in range(table.columnCount()):
+            item = table.item(0, i)
+            try:
+                vals.append(float(item.text()))
+            except (AttributeError, ValueError):
+                return "-"
+        vals.sort()
+        text = f"{len(vals)} level(s)"
+        if len(vals) > 1:
+            spacing = ", ".join(f"{b - a:g}" for a, b in zip(vals, vals[1:]))
+            text += f" - span {vals[-1] - vals[0]:g} MHz - spacing {spacing} MHz"
+        return text
+
+    def _update_level_info(self, *_):
+        self.g_info.setText(self._describe_levels(self.g_table))
+        self.e_info.setText(self._describe_levels(self.e_table))
 
     @staticmethod
     def _vector_table(values):
@@ -584,10 +621,13 @@ class PulseSequenceDialog(QDialog):
         # -- presets ---------------------------------------------------
         self.preset_combo = QComboBox()
         self.preset_combo.addItems(list(shb.PREP_PRESETS))
-        self.preset_combo.currentTextChanged.connect(self._build_preset_fields)
+        self.preset_combo.currentTextChanged.connect(self._on_preset_changed)
         load_btn = QPushButton("Load preset")
-        load_btn.setToolTip("Replace the table with this preparation, rebuilt "
-                            "from the crystal levels currently loaded.")
+        load_btn.setToolTip("Rebuild the table from these settings and the "
+                            "crystal levels currently loaded. The fields "
+                            "above already apply live as you change them - "
+                            "this is for an explicit re-apply, e.g. after a "
+                            "value landed off the df mesh.")
         load_btn.clicked.connect(self._load_preset)
 
         top = QHBoxLayout()
@@ -658,17 +698,45 @@ class PulseSequenceDialog(QDialog):
         spec = shb.PREP_PRESETS.get(name)
         if spec is None:
             return
+        df = shb.settings(self._params)["df"]
         for kwarg, label, default, decimals in spec["fields"]:
             value = default(self._params) if callable(default) else default
             if decimals == 0:
                 w = _ispin(0, 100000, int(value))
             else:
-                w = _dspin(-100000.0, 100000.0, 10.0 ** -min(decimals, 3),
-                           decimals, float(value))
+                # Step by the mesh spacing for MHz fields, so nudging the
+                # spinner mostly stays on-mesh instead of landing off it on
+                # two ticks out of three; "finesse" is the one dimensionless
+                # field among the current presets and keeps a plain decimal
+                # step.
+                step = (10.0 ** -min(decimals, 3) if kwarg == "finesse"
+                       else max(df, 1e-6))
+                w = _dspin(-100000.0, 100000.0, step, decimals, float(value))
+            w.valueChanged.connect(lambda *_: self._apply_preset(quiet=True))
             self._preset_form.addRow(label, w)
             self._preset_fields[kwarg] = w
 
-    def _load_preset(self):
+    def _on_preset_changed(self, name):
+        """The combo box changed under user interaction - rebuild the fields
+        for the new preset and apply it immediately. (__init__ calls
+        _build_preset_fields directly, not through here, so opening the
+        dialog keeps showing the rows it was given rather than jumping to a
+        freshly generated preset.)"""
+        self._build_preset_fields(name)
+        self._apply_preset(quiet=True)
+
+    def _apply_preset(self, *, quiet):
+        """
+        Regenerate the table from the preset builder and the current field
+        values.
+
+        quiet=True (every live field edit) reports a bad combination inline,
+        in the summary label - the spin-box step is aligned to df, but a
+        typed value or an unlucky combination of fields can still land off
+        mesh, and that must not pop a modal on every arrow click. quiet=False
+        (the explicit "Load preset" button) still pops one, since that click
+        is a deliberate action worth a clear stop.
+        """
         name = self.preset_combo.currentText()
         spec = shb.PREP_PRESETS.get(name)
         if spec is None:
@@ -677,9 +745,16 @@ class PulseSequenceDialog(QDialog):
         try:
             rows = spec["builder"](self._params, **kwargs)
         except Exception as exc:                        # noqa: BLE001
-            QMessageBox.critical(self, "Preset", str(exc))
+            if quiet:
+                self.summary.setText(f"! {exc}")
+                self.summary.setStyleSheet("color: #a00;")
+            else:
+                QMessageBox.critical(self, "Preset", str(exc))
             return
         self._set_rows(rows)
+
+    def _load_preset(self):
+        self._apply_preset(quiet=False)
 
     # -- table ----------------------------------------------------------
 
@@ -1152,6 +1227,21 @@ class MainWindow(QMainWindow):
         ps_lay.addStretch(1)
         self.stack.addWidget(ps)
 
+        # QStackedWidget sizes itself to its TALLEST page by default (here,
+        # the Scan page), not the one actually showing - so a short page like
+        # Single hole or Preparation sequence would otherwise leave a large
+        # dead gap between its own controls and the Run button below. Simply
+        # overriding sizeHint()/minimumSizeHint() to the current page's own
+        # is not enough here - the enclosing QGroupBox's own sizeHint() does
+        # not reliably track that override across a page switch (measured:
+        # it disagrees with its own layout's sizeHint() immediately after
+        # setCurrentIndex(), even with every ancestor layout explicitly
+        # invalidated). Capping the stack's actual maximumHeight to the
+        # current page's sizeHint is a harder constraint the layout engine
+        # has to honour regardless, and does track correctly.
+        self.stack.currentChanged.connect(self._size_stack_to_current)
+        self._size_stack_to_current()
+
         outer.addWidget(self.stack)
 
         self.run_btn = QPushButton("Run")
@@ -1297,6 +1387,11 @@ class MainWindow(QMainWindow):
             f"Spectral hole burning - Pr:YSO AFC simulator   [norm: {n:.4f}]")
 
     # -- mode / preview ----------------------------------------------
+
+    def _size_stack_to_current(self, *_):
+        page = self.stack.currentWidget()
+        if page is not None:
+            self.stack.setMaximumHeight(page.sizeHint().height())
 
     def _on_mode_changed(self, idx):
         self.stack.setCurrentIndex(idx)
@@ -1685,8 +1780,15 @@ class MainWindow(QMainWindow):
         Update the folder hint label and the Run button's label from what is
         actually on disk - new / resumable / complete / live / mismatched -
         so the button never has to be taken on faith.
+
+        Only the Scan mode has a folder to inspect; the other modes just get
+        a plain "Run" whenever this fires while idle (it is only ever called
+        from _on_busy(False), after self._job_kind is already None, or from a
+        UI signal firing while idle - never while a job is actually running).
         """
         if self.mode_combo.currentIndex() != 2:
+            self.run_btn.setText("Run")
+            self.run_btn.setEnabled(True)
             return
         busy = self._job_kind is not None
         path = self.sim_dir.text().strip() or self._auto_sim_dir()

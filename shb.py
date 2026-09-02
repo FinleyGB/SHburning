@@ -1168,9 +1168,9 @@ def prep_narrowband_afc(params, *, centre=0.0, bandwidth=4.0,
        across the bandwidth* rather than fired at a single frequency, so
        absorption is restored across the whole AFC band instead of at one spot.
     3. **afc comb** - teeth every ``tooth_spacing`` MHz, each
-       ``tooth_spacing / finesse`` MHz wide, confined to ``bandwidth`` MHz
-       around ``centre`` (:func:`comb_in`). All the teeth share one label, so
-       they burn together the way a comb burn does.
+       ``tooth_spacing / finesse`` MHz wide, placed as one block centred on
+       ``centre`` and sized to fit within ``bandwidth`` MHz. All the teeth
+       share one label, so they burn together the way a comb burn does.
 
     The storage time the comb gives is ``1 / tooth_spacing`` (0.5 MHz -> 2 us).
     """
@@ -1194,18 +1194,22 @@ def prep_narrowband_afc(params, *, centre=0.0, bandwidth=4.0,
                      "sweep": (2 * half_band) * df,
                      "passes": int(passes), "on": True})
 
-    lo_steps, hi_steps = c - half_band, c + half_band
+    # comb_in (like comb_at) always starts its teeth at the band's low edge
+    # and drops whichever tooth overhangs the high edge - fine for a comb
+    # meant to fill a window from one end, but it leaves the AFC band's own
+    # comb visibly skewed toward its low-frequency side instead of straddling
+    # centre. Placed here instead: work out how many whole teeth fit in the
+    # band, then lay that block down symmetrically around c.
+    spacing_steps = int(to_steps(tooth_spacing, df))
     tooth_width = max(df, float(tooth_spacing) / max(1e-9, float(finesse)))
-    tooth_width = max(1, int(round(tooth_width / df))) * df
-    freqs, sp, wd, n_teeth = comb_in(tooth_spacing, tooth_width,
-                                     lo_steps * df, hi_steps * df, params)
-    width_steps = int(round(wd / df))
-    starts = np.round(freqs.reshape(n_teeth, width_steps)[:, 0] / df)
-    for s0 in starts.astype(np.int64):
-        if s0 + width_steps - 1 > hi_steps:
-            continue                    # a last tooth hanging out of the band
-        rows.append(_span_row("afc comb", int(s0), int(s0) + width_steps - 1,
-                              df, passes))
+    width_steps = max(1, int(round(tooth_width / df)))
+    span_steps = 2 * half_band
+    n_teeth = max(1, (span_steps - width_steps) // spacing_steps + 1)
+    footprint = (n_teeth - 1) * spacing_steps + width_steps
+    start0 = c - footprint // 2
+    for i in range(n_teeth):
+        s0 = start0 + i * spacing_steps
+        rows.append(_span_row("afc comb", s0, s0 + width_steps - 1, df, passes))
 
     return [r for r in rows if r is not None]
 
