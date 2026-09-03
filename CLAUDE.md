@@ -210,22 +210,27 @@ see `resolve_teams_webhook`) and `prep_presets.json` (saved
 preparation-sequence presets, see `load_user_presets`). Neither should ever
 show up in `git status` as anything but ignored.
 
-## Pip-installable, and where `prep_presets.json` actually lives
+## Not pip-installable, but still consumed elsewhere
 
-`shb.py` is also a pip package (`pyproject.toml`, `py-modules = ["shb"]`,
-no GUI deps) so other projects (Flyswatter's SHB tab) can `import shb`
-without cloning this repo. Two consequences:
+`shb.py` is deliberately **not** a pip package - it's a single file other
+projects vendor a copy of rather than install. [Flyswatter](https://github.com/Tymin0912/flyswatter)'s
+"Spectral Feature (SHB)" tab is the one doing this today, keeping its own copy
+under `third_party/shb/` (see that repo's `third_party/shb/NOTICE.md` for the
+update procedure). Two things in this file exist *because* of that, and stay
+true regardless of how the copy gets there:
 
 - `cycler` (a matplotlib transitive dependency) is imported lazily, inside
   `apply_style()`'s fallback branch, not at module import time - `_STYLE_FALLBACK`
   stores its colours as a plain list (`_prop_cycle_colors`) and only becomes a
   `cycler.Cycler` when a `Figure` is actually about to be styled. `import shb`
-  costs numpy + scipy + stdlib only; keep it that way - a venv with numpy and
-  scipy but no matplotlib/cycler installed is the regression test
+  costs numpy + scipy + stdlib only; keep it that way - Flyswatter's frozen
+  macOS app excludes matplotlib from the bundle entirely, so a vendored copy
+  that imported `cycler` eagerly would crash on `import shb`. A venv with
+  numpy and scipy but no matplotlib/cycler installed is the regression test
   (`python -c "import shb; shb.validate_params(shb.DEFAULT_PARAMS)"`).
 - `USER_PRESETS_PATH` is resolved by `_user_presets_path()`, not hardcoded to
-  `Path(__file__).with_name(...)`, because that would write into
-  `site-packages` once installed (or a read-only bundle when frozen).
+  `Path(__file__).with_name(...)`, because that would write into whatever
+  directory a vendored copy sits in - read-only inside a frozen `.app` bundle.
   Resolution order: `$SHB_PREP_PRESETS` -> next to `shb.py` if that directory
   is writable and not inside a `site-packages`/`dist-packages` tree
   (preserves today's checkout behaviour) -> the platform user-config dir
