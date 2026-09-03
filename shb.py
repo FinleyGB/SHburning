@@ -66,7 +66,7 @@ __all__ = [
     # core
     "to_steps", "build_transitions", "make_axes", "initial_populations",
     "burn_parallel", "burn_series", "spectrum", "run_burn",
-    "burn_sequence", "run_sequence", "normalisation_factor",
+    "burn_sequence", "run_sequence", "normalisation_factor", "Cancelled",
     # combs / preparation sequences
     "comb", "comb_at", "comb_in", "single_hole",
     "pulse_group", "sequence_stages", "anti_hole_pumps",
@@ -106,9 +106,14 @@ _STYLE_FALLBACK = {
     "axes.titleweight": "bold",
     "axes.spines.top": False,
     "axes.spines.right": False,
-    "axes.prop_cycle": __import__("cycler").cycler(
-        "color", ["#1f77b4", "#e05c2a", "#2ca02c", "#9467bd",
-                  "#8c564b", "#d62728", "#17becf", "#bcbd22"]),
+    # Plain list here, not a cycler.Cycler: cycler is a matplotlib transitive
+    # dependency, and this dict is built at *module import time*. Turning it
+    # into an ``axes.prop_cycle`` happens in apply_style()'s fallback branch
+    # below, where matplotlib (and hence cycler) is known to be importable -
+    # so `import shb` alone costs numpy + stdlib only, which matters for the
+    # frozen app that excludes matplotlib. See CLAUDE.md.
+    "_prop_cycle_colors": ["#1f77b4", "#e05c2a", "#2ca02c", "#9467bd",
+                           "#8c564b", "#d62728", "#17becf", "#bcbd22"],
     "grid.color": "0.85",
     "grid.linewidth": 0.6,
     "grid.alpha": 0.7,
@@ -133,7 +138,10 @@ def apply_style():
         plt.style.use(str(STYLE_PATH))
     except (OSError, ValueError):
         import matplotlib as mpl
-        mpl.rcParams.update(_STYLE_FALLBACK)
+        from cycler import cycler
+        rc = dict(_STYLE_FALLBACK)
+        rc["axes.prop_cycle"] = cycler("color", rc.pop("_prop_cycle_colors"))
+        mpl.rcParams.update(rc)
 
 
 # ===========================================================================
@@ -693,8 +701,14 @@ def run_burn(pump_freqs, params, burn=burn_parallel,
             "pump_freqs": np.asarray(pump_freqs)}
 
 
+class Cancelled(Exception):
+    """Raised by :func:`burn_sequence` / :func:`run_sequence` when their
+    ``should_cancel`` callback returns true. Caught by the caller (typically a
+    GUI worker) to stop cleanly between stages rather than mid-stage."""
+
+
 def burn_sequence(rho, stages, trans_steps, det, det0, params,
-                  burn=burn_parallel, log=None):
+                  burn=burn_parallel, log=None, should_cancel=None):
     """
     Burn a preparation sequence: one stage after another, each acting on the
     populations the previous stage left.
@@ -713,8 +727,15 @@ def burn_sequence(rho, stages, trans_steps, det, det0, params,
     ``stages`` are as :func:`sequence_stages` returns them: dicts with
     ``freqs``, an optional ``passes`` (``None`` uses the configured
     ``pump_passes``) and a ``name`` for the log.
+
+    ``should_cancel``, if given, is called between stages (a stage itself
+    still runs to completion once started - there is no cheaper checkpoint
+    inside a single ``burn`` call); when it returns true this raises
+    :class:`Cancelled` rather than continuing to the next stage.
     """
     for st in stages:
+        if should_cancel is not None and should_cancel():
+            raise Cancelled()
         freqs = np.asarray(st["freqs"], dtype=float)
         if freqs.size == 0:
             continue
@@ -728,7 +749,7 @@ def burn_sequence(rho, stages, trans_steps, det, det0, params,
 
 
 def run_sequence(stages, params, burn=burn_parallel, fmin=None, fmax=None,
-                 ctx=None, log=None):
+                 ctx=None, log=None, should_cancel=None):
     """
     :func:`run_burn` for a preparation sequence: set up, burn the stages in
     order, take the spectrum.
@@ -739,12 +760,15 @@ def run_sequence(stages, params, burn=burn_parallel, fmin=None, fmax=None,
         stages        the stages that were burned, in order
 
     with ``pump_freqs`` holding every frequency the sequence used.
+
+    ``should_cancel``, if given, is forwarded to :func:`burn_sequence` and
+    checked between stages; see there for what "between stages" means.
     """
     g, e, trans, trans_steps = build_transitions(params)
     f, det, det0 = make_axes(params, trans_steps, fmin, fmax)
     rho0 = initial_populations(g, det)
     rho = burn_sequence(rho0, stages, trans_steps, det, det0, params,
-                        burn=burn, log=log)
+                        burn=burn, log=log, should_cancel=should_cancel)
     spec = spectrum(rho, trans, det, f, params, ctx=ctx)
 
     parts = [np.asarray(st["freqs"], dtype=float) for st in stages
@@ -1394,7 +1418,49 @@ PREP_PRESETS = {
 }
 
 
-USER_PRESETS_PATH = Path(__file__).with_name("prep_presets.json")
+def _user_presets_path():
+    """
+    Where saved sequence-editor presets live.
+
+    ``Path(__file__).with_name(...)`` (the old, unconditional choice) writes
+    next to this module - fine for a checkout, but that becomes
+    ``site-packages`` once ``shb`` is pip-installed (no business writing
+    there) and a read-only bundle when frozen (can't write there at all). So:
+
+    1. ``$SHB_PREP_PRESETS``, if set - an explicit override wins outright.
+    2. Next to this module, if that directory is writable and is not inside a
+       ``site-packages``/``dist-packages`` tree - preserves today's checkout
+       behaviour exactly (this is also why the module attribute below is
+       still called ``USER_PRESETS_PATH`` and still resolves to
+       ``./prep_presets.json`` for anyone running from a clone).
+    3. Otherwise the platform's per-user config directory
+       (``~/.config/shb/prep_presets.json`` on Linux,
+       ``~/Library/Application Support/shb/prep_presets.json`` on macOS,
+       ``%APPDATA%\\shb\\prep_presets.json`` on Windows), created if needed.
+    """
+    env = os.environ.get("SHB_PREP_PRESETS")
+    if env:
+        return Path(env)
+
+    here = Path(__file__).resolve().parent
+    parts = {p.lower() for p in here.parts}
+    in_site_packages = "site-packages" in parts or "dist-packages" in parts
+    if not in_site_packages and os.access(here, os.W_OK):
+        return here / "prep_presets.json"
+
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    elif sys.platform.startswith("win"):
+        base = Path(os.environ.get("APPDATA", Path.home()))
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / "shb" / "prep_presets.json"
+
+
+#: Resolved once at import time - see :func:`_user_presets_path`. Kept as a
+#: module attribute (rather than only a function) so existing code/tests that
+#: read ``shb.USER_PRESETS_PATH`` keep working unchanged.
+USER_PRESETS_PATH = _user_presets_path()
 
 
 def load_user_presets():
@@ -1410,10 +1476,11 @@ def load_user_presets():
     Returns ``{}`` if the file does not exist or cannot be parsed - a missing
     or corrupt preset file should never stop the sequence editor from opening.
     """
-    if not USER_PRESETS_PATH.exists():
+    path = _user_presets_path()
+    if not path.exists():
         return {}
     try:
-        with open(USER_PRESETS_PATH) as fh:
+        with open(path) as fh:
             data = json.load(fh)
     except (OSError, json.JSONDecodeError):
         return {}
@@ -1427,7 +1494,9 @@ def save_user_preset(name, rows):
         raise ValueError("a preset needs a name")
     presets = load_user_presets()
     presets[name] = rows
-    _atomic_write_json(USER_PRESETS_PATH, presets)
+    path = _user_presets_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(path, presets)
 
 
 def delete_user_preset(name):
@@ -1435,7 +1504,9 @@ def delete_user_preset(name):
     presets = load_user_presets()
     if name in presets:
         del presets[name]
-        _atomic_write_json(USER_PRESETS_PATH, presets)
+        path = _user_presets_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(path, presets)
 
 
 # ===========================================================================

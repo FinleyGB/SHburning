@@ -13,6 +13,23 @@ module, `shb.py`, with a PyQt6 GUI (`shb_gui.py`) on top.
 pip install -r requirements.txt
 ```
 
+### As a library, in another project
+
+`shb.py` is also pip-installable on its own (`pyproject.toml`), with no GUI
+dependencies pulled in - `import shb` costs numpy + scipy + stdlib only:
+
+```bash
+pip install "shb @ git+https://github.com/FinleyGB/SHburning@dev"
+# or, for the GUI extras too:
+pip install "shb[gui] @ git+https://github.com/FinleyGB/SHburning@dev"
+```
+
+This is how [Flyswatter](https://github.com/Tymin0912/flyswatter)'s
+"Spectral Feature (SHB)" tab consumes it, running the burn / preparation-
+sequence machinery (everything except `run_scan`) to hand a burnt spectrum to
+its solver. See `shb.py`'s module docstring for the layout and `CLAUDE.md` for
+the invariants a caller has to respect (`df`, stage ordering, ...).
+
 ## Run
 
 Desktop GUI:

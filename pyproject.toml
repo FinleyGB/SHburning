@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shb"
+version = "0.1.0"
+description = "Spectral hole burning in Pr:YSO, and AFC design"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "scipy>=1.10"]
+
+[project.optional-dependencies]
+gui = ["PyQt6>=6.7", "matplotlib>=3.8", "plotly", "tqdm"]
+
+[tool.setuptools]
+py-modules = ["shb"]

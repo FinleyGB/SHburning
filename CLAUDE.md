@@ -62,6 +62,15 @@ simultaneous while a pit and its burn-back stay ordered; don't change it to
 `run_sequence` returns `run_burn`'s dict plus `stages`, which is what lets the
 GUI's plot and export paths stay unchanged - keep that shape.
 
+Both `burn_sequence` and `run_sequence` take an optional `should_cancel`
+callback, checked between stages (never mid-stage - there is no cheaper
+checkpoint inside one `burn` call) and raising `shb.Cancelled` when it
+returns true. This is what makes the GUI's Cancel button effective on a
+sequence burn; `SimWorker.run_sequence_job` (`shb_gui.py`) wires it to
+`self._cancel` and catches `shb.Cancelled`. `run_burn`/`run_burn_job` (a flat,
+one-stage burn) has no equivalent hook - there's no stage boundary to check
+at.
+
 Two helpers hold the physics, and both are derived from the crystal rather than
 written down, so they follow whichever level table is loaded:
 
@@ -200,3 +209,28 @@ committed: `.teams_webhook` (the Teams alert webhook URL - a bearer secret,
 see `resolve_teams_webhook`) and `prep_presets.json` (saved
 preparation-sequence presets, see `load_user_presets`). Neither should ever
 show up in `git status` as anything but ignored.
+
+## Pip-installable, and where `prep_presets.json` actually lives
+
+`shb.py` is also a pip package (`pyproject.toml`, `py-modules = ["shb"]`,
+no GUI deps) so other projects (Flyswatter's SHB tab) can `import shb`
+without cloning this repo. Two consequences:
+
+- `cycler` (a matplotlib transitive dependency) is imported lazily, inside
+  `apply_style()`'s fallback branch, not at module import time - `_STYLE_FALLBACK`
+  stores its colours as a plain list (`_prop_cycle_colors`) and only becomes a
+  `cycler.Cycler` when a `Figure` is actually about to be styled. `import shb`
+  costs numpy + scipy + stdlib only; keep it that way - a venv with numpy and
+  scipy but no matplotlib/cycler installed is the regression test
+  (`python -c "import shb; shb.validate_params(shb.DEFAULT_PARAMS)"`).
+- `USER_PRESETS_PATH` is resolved by `_user_presets_path()`, not hardcoded to
+  `Path(__file__).with_name(...)`, because that would write into
+  `site-packages` once installed (or a read-only bundle when frozen).
+  Resolution order: `$SHB_PREP_PRESETS` -> next to `shb.py` if that directory
+  is writable and not inside a `site-packages`/`dist-packages` tree
+  (preserves today's checkout behaviour) -> the platform user-config dir
+  (`~/.config/shb/`, `%APPDATA%\shb\`, `~/Library/Application Support/shb/`).
+  `load_user_presets`/`save_user_preset`/`delete_user_preset` all call
+  `_user_presets_path()` fresh rather than closing over the module attribute,
+  so changing `$SHB_PREP_PRESETS` mid-process (tests) takes effect
+  immediately.
