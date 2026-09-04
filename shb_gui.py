@@ -68,10 +68,11 @@ from PyQt6.QtWidgets import (  # noqa: E402
     QGroupBox, QComboBox, QCheckBox, QPushButton, QLabel, QLineEdit, QSpinBox,
     QDoubleSpinBox, QPlainTextEdit, QStackedWidget, QProgressBar, QFileDialog,
     QMessageBox, QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem,
-    QTabWidget, QScrollArea, QSizePolicy)
+    QTabWidget, QScrollArea, QSizePolicy, QInputDialog)
 
 import matplotlib  # noqa: E402
 matplotlib.use("QtAgg")
+import matplotlib.colors as mcolors  # noqa: E402
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg  # noqa: E402
 from matplotlib.backends.backend_qt import NavigationToolbar2QT  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
@@ -195,7 +196,8 @@ class SimWorker(QObject):
             stages = shb.sequence_stages(rows, params)
             self.log.emit(summary)
             out = shb.run_sequence(stages, params, burn=burn,
-                                   log=self.log.emit)
+                                   log=self.log.emit,
+                                   should_cancel=lambda: self._cancel)
             self.log.emit("spectrum done")
             spec = out["spec"]
             p = shb.settings(params)
@@ -204,6 +206,8 @@ class SimWorker(QObject):
                 f"(dAbsorption {spec.max() - spec.min():.2f}, "
                 f"unburned {p['alpha']:.2f})")
             self.burn_done.emit(out)
+        except shb.Cancelled:
+            self.log.emit("sequence cancelled")
         except Exception as exc:                       # noqa: BLE001
             self.error.emit(str(exc))
         finally:
