@@ -1257,6 +1257,7 @@ class MainWindow(QMainWindow):
         for text, slot in [
             ("Import config (.json)...", self._import_config),
             ("Open run folder...", self._open_run_folder),
+            ("Open exported scan (.pkl)...", self._open_scan_pickle),
             ("Export...", self._open_export),
         ]:
             act = QAction(text, self)
@@ -1438,8 +1439,11 @@ class MainWindow(QMainWindow):
         # one comb
         oc = QWidget()
         oc_form = QFormLayout(oc)
-        self.tooth_spacing = _dspin(0.001, 1000, 0.01, 3, 2.35)
-        self.burn_width = _dspin(0.001, 1000, 0.01, 3, 1.18)
+        self.tooth_spacing = _dspin(0.001, 1000, max(self.df.value(), 1e-6),
+                                    3, 2.35)
+        self.burn_width = _dspin(0.001, 1000, max(self.df.value(), 1e-6),
+                                 3, 1.18)
+        self.df.valueChanged.connect(self._sync_comb_steps)
         self.tooth_spacing.valueChanged.connect(self._refresh_comb_preview)
         self.burn_width.valueChanged.connect(self._refresh_comb_preview)
         self.comb_info = QLabel("-")
@@ -1736,6 +1740,16 @@ class MainWindow(QMainWindow):
         return freqs, (f"scan preview: t_s {1 / sp:.3g} us, comb at "
                        f"{sp:g} MHz, F {sp / wd:.1f}"), None
 
+    def _sync_comb_steps(self, *_):
+        """Keep tooth_spacing/burn_width spinner steps on the df mesh.
+
+        A fixed step would drift off-mesh as soon as df changes, making it
+        easy to nudge tooth_spacing/burn_width into a value to_steps rejects.
+        """
+        step = max(self.df.value(), 1e-6)
+        self.tooth_spacing.setSingleStep(step)
+        self.burn_width.setSingleStep(step)
+
     def _refresh_comb_preview(self, *_):
         """Live pump-comb preview; the plot returns to preview when inputs change."""
         try:
@@ -1817,7 +1831,12 @@ class MainWindow(QMainWindow):
             self._write_sim_dir_config(sim_dir, params)
             self.request_scan.emit(params, kwargs)
         else:
-            freqs, summary, stages = self._current_pump_freqs(params)
+            try:
+                freqs, summary, stages = self._current_pump_freqs(params)
+            except Exception as exc:                       # noqa: BLE001
+                self.plot.show_message(str(exc))
+                self._on_error(str(exc))
+                return
             self._job_kind = "burn"
             if stages is not None:
                 self._append_log("--- preparation sequence ---")
@@ -2187,6 +2206,34 @@ class MainWindow(QMainWindow):
         self._sim_root = os.path.dirname(path) or path
         self._append_log(f"opened {path}: {scan['state']}, "
                          f"{scan['n_done']}/{scan['n_total']} burns")
+        self._on_scan_done(scan)
+
+    def _open_scan_pickle(self):
+        """
+        Load a standalone `*_scan.pkl` (written by the Export tab) back into
+        the plot - for a scan whose sim_dir has since been moved, archived,
+        or deleted, so "Open run folder..." no longer applies.
+        """
+        path = self._file_dialog("Open an exported scan",
+                                 self._sim_root or os.getcwd(),
+                                 directory=False, name_filter="Scan pickle (*.pkl)")
+        if not path:
+            return
+        try:
+            with open(path, "rb") as fh:
+                scan = pickle.load(fh)
+            if not isinstance(scan, dict) or "results" not in scan or "best" not in scan:
+                raise ValueError("not an exported scan - missing 'results'/'best'")
+        except Exception as exc:                        # noqa: BLE001
+            self._on_error(f"could not read {path}: {exc}")
+            return
+        # sim_dir is whatever was live when this was exported - drop it if
+        # that folder is gone, so the export hint / Collect button don't
+        # point at a path that no longer exists.
+        if scan.get("sim_dir") and not os.path.isdir(scan["sim_dir"]):
+            scan["sim_dir"] = None
+        self._append_log(f"opened {path}: {len(scan['best'])} top spectra, "
+                         f"{len(scan['results'])} grid cells")
         self._on_scan_done(scan)
 
     def _refresh_export_enabled(self):
