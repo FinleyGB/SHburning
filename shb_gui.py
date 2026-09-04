@@ -79,6 +79,17 @@ from matplotlib.figure import Figure  # noqa: E402
 import shb  # noqa: E402
 
 
+# Default root for auto-named simulation folders (see MainWindow._auto_sim_dir /
+# _pick_sim_dir): the lab's shared Dropbox scan storage. Falls back to the
+# current directory if that Dropbox isn't mounted on this machine.
+_DROPBOX_SIM_ROOT = (
+    r"C:\Users\GEM love\Heriot-Watt University Team Dropbox\RES_EPS_Quantum_"
+    r"Photonics_Lab\Experiments\Current Experiments\Visible Quantum Memory"
+    r"\SHB_simulations\Pr_YSO"
+)
+DEFAULT_SIM_ROOT = _DROPBOX_SIM_ROOT if os.path.isdir(_DROPBOX_SIM_ROOT) else None
+
+
 def fmt_dur(secs):
     """Seconds as a short human string: '8s', '1m20s', '3m', '2h5m'."""
     secs = max(0, int(round(secs)))
@@ -1207,7 +1218,7 @@ class MainWindow(QMainWindow):
         self._job_kind = None           # "burn" | "scan" | "norm" | None
         self._progress_base = None      # first "done" seen this job, for a
                                         # resumed scan's ETA (see _on_progress)
-        self._sim_root = None           # remembered parent for auto-named
+        self._sim_root = DEFAULT_SIM_ROOT  # remembered parent for auto-named
                                         # simulation folders
 
         self._sequence_rows = []        # preparation-sequence editor rows
