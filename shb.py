@@ -197,7 +197,7 @@ DEFAULT_PARAMS = _default_params()
 # function). It goes into every simulation folder's manifest, so a resume
 # against an old checkpoint is refused rather than silently mixing two
 # versions of the metric into one results table.
-QUALITY_VERSION = 1
+QUALITY_VERSION = 2
 
 
 def _preset(g, e, dm, h_width, in_width, fmin, fmax, df):
@@ -1454,6 +1454,68 @@ def _fmt_dur(seconds):
     return f"{s}s"
 
 
+# Tuning knob for the squareness term in _score_quality: a peak or dip inside
+# one tooth period must exceed this fraction of that period's own
+# peak-to-floor range to count as a genuine defect (ringing / sub-structure)
+# rather than numerical noise.
+_SQUARENESS_PROMINENCE_FRAC = 0.05
+
+
+def _local_maxima_1d(x):
+    """Indices of strict local maxima of ``x`` (higher than both neighbours);
+    endpoints never count. A tiny hand-rolled stand-in for
+    ``scipy.signal.find_peaks`` - see :func:`_peak_prominences_1d` for why."""
+    if len(x) < 3:
+        return np.empty(0, dtype=int)
+    mask = (x[1:-1] > x[:-2]) & (x[1:-1] > x[2:])
+    return np.where(mask)[0] + 1
+
+
+def _peak_prominences_1d(x, peak_idx):
+    """
+    Topographic prominence of each index in ``peak_idx`` (as returned by
+    :func:`_local_maxima_1d`): from each peak, walk outward in both
+    directions until either the array boundary or a point higher than the
+    peak itself, tracking the lowest point crossed; the prominence is the
+    peak's height above the higher of its two lowest crossings. This is the
+    same definition ``scipy.signal.find_peaks(..., prominence=...)`` uses.
+
+    Reimplemented here in plain numpy/Python rather than imported from
+    ``scipy.signal`` deliberately: unlike the ``scipy.fft`` calls used
+    elsewhere in this module (pure C, no Fortran/LAPACK), importing
+    ``scipy.signal`` pulls in ``scipy.linalg``, which on a typical Windows
+    Anaconda build is linked against Intel MKL's Fortran runtime. That
+    runtime installs its own Windows console Ctrl+C handler, which can
+    broadcast a spurious ``CTRL_C_EVENT`` to the whole console process group
+    when a linked subprocess exits - hitting every worker *and* the GUI's
+    main thread as a bare ``KeyboardInterrupt``, with no keypress involved.
+    ``_score_quality`` runs inside every scan worker, so it must not import
+    anything that can trigger this.
+    """
+    n = len(x)
+    proms = np.empty(len(peak_idx), dtype=float)
+    for k, i in enumerate(peak_idx):
+        peak = x[i]
+        left_min = peak
+        j = i
+        while j > 0:
+            j -= 1
+            if x[j] > peak:
+                break
+            if x[j] < left_min:
+                left_min = x[j]
+        right_min = peak
+        j = i
+        while j < n - 1:
+            j += 1
+            if x[j] > peak:
+                break
+            if x[j] < right_min:
+                right_min = x[j]
+        proms[k] = peak - max(left_min, right_min)
+    return proms
+
+
 # NOTE: this function is still being tuned (see the git history) - bump
 # QUALITY_VERSION above whenever its formula changes, or a resumed scan will
 # silently mix qualities computed two different ways into one results table.
@@ -1461,14 +1523,15 @@ def _score_quality(f, spec, target_window, spacing_mhz):
     """
     AFC comb-quality score over ``target_window`` MHz at the centre of ``f``.
 
-    A clean broadband AFC has regular, equal-height teeth with deep flat dips; a
-    bad one has irregular teeth, ringing / sub-structure, aperiodic baseline
-    wander or a low duty cycle. A plain Michelson visibility
-    ``(A_max - A_min) / (A_max + A_min)`` cannot tell them apart - both hit the
-    same extreme samples. This score multiplies three factors, each in ``[0, 1]``,
-    so a comb has to be deep *and* regular *and* spectrally clean to score well::
+    A clean broadband AFC has regular, equal-height teeth with deep flat dips
+    and a single flat-topped bump per period; a bad one has irregular teeth,
+    ringing / sub-structure inside a tooth, or aperiodic drift between
+    periods. A plain Michelson visibility ``(A_max - A_min) / (A_max + A_min)``
+    cannot tell them apart - both hit the same extreme samples. This score
+    multiplies four factors, each in ``[0, 1]``, so a comb has to be deep,
+    regular, periodic *and* square to score well::
 
-        Q = mean_j(v_j) * uniformity * purity
+        Q = mean_j(v_j) * uniformity * periodicity * squareness
 
     where the window is cropped to a whole number of tooth periods
     (``spacing_mhz`` is the known tooth spacing, so ``per = spacing_mhz / df`` is
@@ -1476,12 +1539,28 @@ def _score_quality(f, spec, target_window, spacing_mhz):
 
     * ``v_j = (p95_j - p05_j) / (p95_j + p05_j)`` is the robust per-period depth
       (5th/95th percentiles, so ringing spikes do not dominate);
-    * ``uniformity = 1 - std(peak_j) / mean(peak_j)`` with ``peak_j`` the per-period
-      95th percentile - penalises tooth-to-tooth height scatter;
-    * ``purity = (A1 / sqrt(2)) / rms(spec - mean)`` is the fraction of the
-      windowed AC power sitting in the fundamental comb period ``A1`` (a single-bin
-      DFT at ``spacing_mhz``) - ringing, sub-structure and aperiodicity all leak
-      power off the fundamental and drop it.
+    * ``uniformity = 1 - std(v_j) / mean(v_j)`` penalises tooth-to-tooth scatter
+      in that same per-period depth - both irregular peak heights and irregular
+      dip floors count against it;
+    * ``periodicity`` is the fraction of the windowed AC power sitting at
+      harmonics of the fundamental comb frequency (every multiple of
+      ``1 / spacing_mhz``, via a real FFT of the truncated segment) - genuine
+      period-to-period drift or aperiodicity leaks power off those bins and
+      drops it. An earlier version used only the fundamental bin, which is
+      duty-cycle biased: a mathematically perfect, ringing-free narrow-duty
+      rectangular pulse train legitimately puts most of its power in
+      harmonics rather than the fundamental, so that version penalised high
+      finesse on its own, independent of any real raggedness. Summing every
+      harmonic fixes that - it stays ~1 for a perfect comb at any finesse;
+    * ``squareness`` penalises extra bumps/dips *inside* one tooth period
+      (ringing / sub-structure) - the one defect nothing above catches, since
+      a period can be deep, regular and duty-cycle-fair yet still ragged. The
+      per-period template (periods averaged together) is searched for
+      significant peaks and dips (topographic prominence over
+      ``_SQUARENESS_PROMINENCE_FRAC`` of the template's own range - see
+      :func:`_peak_prominences_1d`); a clean tooth has exactly one dominant
+      feature, so the largest is exempted and every other peak/dip's
+      prominence is charged against the score.
 
     With fewer than two whole periods in the window there is no comb to speak of
     and the score falls back to the robust whole-window depth alone.
@@ -1511,27 +1590,43 @@ def _score_quality(f, spec, target_window, spacing_mhz):
 
     keep = n_per * per
     s = seg[:keep]
-    x = fseg[:keep]
 
-    # per-period robust depth + tooth-height uniformity
+    # per-period robust depth + tooth-to-tooth uniformity
     chunks = s.reshape(n_per, per)
     lo_j, hi_j = np.percentile(chunks, [5.0, 95.0], axis=1)
     denom = hi_j + lo_j
     v_j = np.where(denom > 0.0, (hi_j - lo_j) / denom, 0.0)
-    mean_peak = float(hi_j.mean())
-    uniformity = (1.0 - float(hi_j.std()) / mean_peak) if mean_peak > 0.0 else 0.0
+    mean_v = float(v_j.mean())
+    uniformity = (1.0 - float(v_j.std()) / mean_v) if mean_v > 0.0 else 0.0
     uniformity = float(np.clip(uniformity, 0.0, 1.0))
 
-    # spectral purity: AC power fraction in the fundamental comb period
+    # periodicity: AC power fraction sitting at harmonics of the comb's
+    # fundamental frequency (not just the fundamental itself - see docstring)
     g = s - s.mean()
-    p_ac = float(np.sqrt(np.mean(g * g)))
-    if p_ac <= 0.0:
+    power = np.abs(np.fft.rfft(g)) ** 2
+    total_power = float(power[1:].sum())               # drop DC (index 0)
+    if total_power <= 0.0:
         return 0.0
-    w = (2.0 * np.pi / spacing_mhz) * x
-    a1 = (2.0 / keep) * float(np.hypot(g @ np.cos(w), g @ np.sin(w)))
-    purity = float(np.clip((a1 / np.sqrt(2.0)) / p_ac, 0.0, 1.0))
+    harmonics = np.arange(n_per, power.size, n_per)
+    periodicity = float(np.clip(power[harmonics].sum() / total_power, 0.0, 1.0))
 
-    return float(np.clip(float(v_j.mean()) * uniformity * purity, 0.0, 1.0))
+    # squareness: penalise extra peaks/dips inside one tooth period
+    template = chunks.mean(axis=0)
+    template_range = float(template.max() - template.min())
+    if template_range <= 0.0:
+        squareness = 1.0
+    else:
+        thresh = _SQUARENESS_PROMINENCE_FRAC * template_range
+        peak_idx = _local_maxima_1d(template)
+        dip_idx = _local_maxima_1d(-template)
+        peak_proms = _peak_prominences_1d(template, peak_idx)
+        dip_proms = _peak_prominences_1d(-template, dip_idx)
+        proms = np.concatenate([peak_proms, dip_proms])
+        proms = proms[proms >= thresh]
+        excess = float(proms.sum() - proms.max()) if proms.size else 0.0
+        squareness = float(np.clip(1.0 - excess / template_range, 0.0, 1.0))
+
+    return float(np.clip(mean_v * uniformity * periodicity * squareness, 0.0, 1.0))
 
 
 def _estimate_worker_bytes(params, min_finesse=1.0):
@@ -1605,7 +1700,7 @@ def _available_bytes():
         pages = os.sysconf("SC_PHYS_PAGES")
         page_size = os.sysconf("SC_PAGE_SIZE")
         return int(0.5 * pages * page_size), "half of total (coarse)"
-    except (ValueError, OSError):
+    except (ValueError, OSError, AttributeError):
         return 4_000_000_000, "unknown - guessed 4 GB"
 
 
@@ -1810,8 +1905,9 @@ def run_scan(storage_min, storage_max, n_points,
     """
     Sweep AFC storage time and comb finesse, scoring each spectrum by its AFC
     comb-quality score (:func:`_score_quality`) over a window at the centre -
-    per-period depth times tooth-height uniformity times spectral purity, so a
-    clean regular comb outranks a deep-but-messy one.
+    per-period depth times tooth-to-tooth uniformity times periodicity times
+    squareness, so a clean regular comb outranks a deep-but-messy one at any
+    finesse.
 
     The spectrum window and mesh come from ``params`` - fmin, fmax and df are
     not swept here.
@@ -2446,15 +2542,40 @@ def _diff_burn_spec(old, new):
     return diffs
 
 
+def _replace_with_retry(src, dst, attempts=20, delay=0.1):
+    """
+    ``os.replace(src, dst)`` that tolerates a cloud-synced folder (Dropbox,
+    OneDrive, ...) transiently holding ``dst`` open.
+
+    Those clients open a file for hashing/upload right after it changes, and
+    on Windows that briefly makes ``os.replace`` fail with "access is
+    denied" (WinError 5) or a sharing violation (WinError 32) even though
+    nothing in this process is holding it. The lock is normally gone within
+    a few hundred ms, so a short retry clears it instead of crashing a scan
+    whose ``sim_dir`` happens to live in a synced folder - see
+    :func:`_atomic_write_json`, the only caller.
+    """
+    for i in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except (PermissionError, OSError) as exc:
+            transient = isinstance(exc, PermissionError) or getattr(exc, "winerror", None) == 32
+            if not transient or i == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
 def _atomic_write_json(path, obj):
     """Write JSON to ``path`` via a temp file + ``os.replace``, so a reader
-    never observes a half-written file."""
+    never observes a half-written file. See :func:`_replace_with_retry` for
+    why the final rename tolerates a momentary lock from a synced folder."""
     d = os.path.dirname(path) or "."
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-", suffix=".json")
     try:
         with os.fdopen(fd, "w") as fh:
             json.dump(obj, fh, indent=2, default=_json_default)
-        os.replace(tmp, path)
+        _replace_with_retry(tmp, path)
     except BaseException:
         try:
             os.remove(tmp)
