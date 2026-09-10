@@ -1581,8 +1581,10 @@ class MainWindow(QMainWindow):
         self.exp_config = QCheckBox("Simulation config (.json)")
         self.exp_figures = QCheckBox("Figures (.png)")
         self.exp_data = QCheckBox("Data (.npy + .csv)")
+        self.exp_pickle = QCheckBox("Scan pickle (.pkl, for reopening via "
+                                    "File > Open exported scan...)")
         for cb in (self.exp_log, self.exp_config, self.exp_figures,
-                   self.exp_data):
+                   self.exp_data, self.exp_pickle):
             cb.setChecked(True)
             lay.addWidget(cb)
 
@@ -2073,11 +2075,11 @@ class MainWindow(QMainWindow):
     # -- simulation folder -------------------------------------------
 
     def _auto_sim_dir(self):
-        """A fresh run-folder name under the remembered root: sim_<tag>_df<df>_<timestamp>."""
+        """A fresh run-folder name under the remembered root: <timestamp>_sim_<tag>_df<df>."""
         root = self._sim_root or os.getcwd()
         tag = f"{self.storage_min.value():g}-{self.storage_max.value():g}us"
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        return os.path.join(root, f"sim_{tag}_df{self.df.value():g}_{stamp}")
+        return os.path.join(root, f"{stamp}_sim_{tag}_df{self.df.value():g}")
 
     def _resolved_sim_dir(self):
         """
@@ -2375,9 +2377,10 @@ class MainWindow(QMainWindow):
                     mm.flush()
                     del mm
                     note(f"{base}_top_spectra.npy")
-                with open(f"{base}_scan.pkl", "wb") as fh:
-                    pickle.dump(self._scan, fh)
-                note(f"{base}_scan.pkl")
+                if self.exp_pickle.isChecked():
+                    with open(f"{base}_scan.pkl", "wb") as fh:
+                        pickle.dump(self._scan, fh)
+                    note(f"{base}_scan.pkl")
             elif self._last_burn is not None:
                 out = self._last_burn
                 np.save(f"{base}_spectrum.npy",

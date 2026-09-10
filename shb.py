@@ -1966,6 +1966,26 @@ def _spectrum_for(item):
     return _spectrum_at(item, _WORKER_CTX)
 
 
+def _target_match(t_target, f_target, spacing_mhz, width_mhz):
+    """
+    How closely a burnt comb's actual storage time/finesse match a scan
+    cell's request, in ``[0, 1]``.
+
+    Each requested ``(t, F)`` cell is snapped to the nearest df-mesh comb
+    before burning (see :func:`run_scan`); at coarse ``df``, or at high
+    finesse where the width rounds to very few distinct steps, many adjacent
+    cells collide onto the same actual comb and would otherwise all be
+    stamped with that one comb's shape quality regardless of how far their
+    own request sat from what was actually burnt. This factor fades a cell's
+    quality down the further its actual storage time/finesse sit from what it
+    asked for, so a block of collided cells reads as a gradient rather than a
+    flat stripe.
+    """
+    t_err = abs(1.0 / spacing_mhz - t_target) / t_target
+    f_err = abs(spacing_mhz / width_mhz - f_target) / f_target
+    return float(np.clip(1.0 - t_err, 0.0, 1.0) * np.clip(1.0 - f_err, 0.0, 1.0))
+
+
 def run_scan(storage_min, storage_max, n_points,
              finesse_min, finesse_max, n_finesse,
              target_window, top_n, pump_passes,
@@ -2138,7 +2158,9 @@ def run_scan(storage_min, storage_max, n_points,
             if q is None:
                 n_missing += 1
                 continue
-            results.append({"spacing_MHz": s * df, "width_MHz": w * df,
+            spacing_mhz, width_mhz = s * df, w * df
+            q *= _target_match(t, F, spacing_mhz, width_mhz)
+            results.append({"spacing_MHz": spacing_mhz, "width_MHz": width_mhz,
                             "finesse": F, "storage_us": t, "quality": q})
         return results, n_missing
 
@@ -2965,7 +2987,9 @@ def load_run(sim_dir):
         if q is None:
             n_missing += 1
             continue
-        results.append({"spacing_MHz": s * df, "width_MHz": w * df,
+        spacing_mhz, width_mhz = s * df, w * df
+        q *= _target_match(t, F, spacing_mhz, width_mhz)
+        results.append({"spacing_MHz": spacing_mhz, "width_MHz": width_mhz,
                         "finesse": F, "storage_us": t, "quality": q})
 
     best = []
