@@ -92,9 +92,13 @@ integer factor, bounded by mesh size, time, and memory - see
 resolve on the configured mesh.
 
 The sweep itself is **score-only**: each worker returns
-`(quality, n, spacing_MHz, width_MHz)`, not the spectrum - a spectrum and its
-frequency axis are ~1.6 MB at `df=0.001`, so returning them per point would
-pickle gigabytes back to the parent to keep a few dozen. Once the sweep
+`(quality, n, spacing_MHz, width_MHz, measured_finesse)`, not the spectrum - a
+spectrum and its frequency axis are ~1.6 MB at `df=0.001`, so returning them
+per point would pickle gigabytes back to the parent to keep a few dozen.
+`measured_finesse` is one float, read off the averaged one-period template
+`_score_quality_and_finesse` already builds (`_score_quality` is the
+score-only wrapper) - anything else per-point you want recorded should come
+the same way, as a scalar, never as an array. Once the sweep
 picks its top-N winners (by quality), a short **collect pass** re-burns just
 those and shares one frequency axis across every kept record. Preserve this
 shape when touching `run_scan` - don't have workers return full spectra again
@@ -158,7 +162,19 @@ different ways into one results table.
   keys land on the same mesh points.
 - `progress.csv` - **append-only**, one row per completed burn. This is the
   actual checkpoint; it is what makes a crash lose at most a few seconds of
-  work. Never rewrite it wholesale.
+  work. Never rewrite it wholesale. Columns are `_PROGRESS_HEADER`; a new
+  column goes **at the end**, so older columns keep their index. Folders
+  from before `measured_finesse` have the 7-column `_PROGRESS_HEADER_V1`
+  header, and a resume appends 8-column rows beneath it, so
+  `_read_progress_rows` accepts both widths under the old header (old rows
+  read as `nan`). Under the current header it accepts only the full width.
+  `_trim_torn_tail` cuts an unterminated final line before appending, so a
+  torn row can't glue onto the next one and pass as a full-width row. Keep
+  both of those if you add another column. `measured_finesse` is reported
+  data, not part of `burn_spec`, so adding the column needed no
+  `QUALITY_VERSION` bump. The `results` row keys and `results.csv` columns
+  are `RESULTS_COLUMNS`, and the scan figures are `SCAN_FIGURES`; the GUI
+  export uses both, so add to them rather than to a local list.
 - `status.json` - atomically replaced (`_atomic_write_json`, tmp + rename),
   advisory only (`_read_progress` never consults it - a resume works even
   with no `status.json` at all). It doubles as the run's lock: a folder is

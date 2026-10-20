@@ -61,7 +61,8 @@ if sys.platform == "win32":  # noqa: E402
 # (e.g. a conda env's own PyQt5) and PyQt6 isn't imported first, matplotlib
 # can silently pick the wrong major version and crash on mismatched Qt
 # instances.
-from PyQt6.QtCore import QObject, Qt, QThread, QTimer, QUrl, pyqtSignal  # noqa: E402
+from PyQt6.QtCore import (  # noqa: E402
+    QLocale, QObject, Qt, QThread, QTimer, QUrl, pyqtSignal)
 from PyQt6.QtGui import QAction  # noqa: E402
 from PyQt6.QtWidgets import (  # noqa: E402
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QFormLayout,
@@ -236,7 +237,8 @@ class SimWorker(QObject):
                 b = best[0]
                 self.log.emit(
                     f"[{scan['tag']}] best: AFC comb quality {b['quality']:.3f} at "
-                    f"t_s {b['storage_us']:.3g} us, F {b['finesse']:.1f} "
+                    f"t_s {b['storage_us']:.3g} us, F {b['finesse']:.1f}"
+                    f"{shb._measured_note(b)} "
                     f"(spacing {b['spacing_MHz']:.3f} MHz, "
                     f"width {b['width_MHz']:.3f} MHz)")
             self.scan_done.emit(scan)
@@ -493,6 +495,10 @@ class StackedPlot(QWidget):
                 shb.plot_scan_heatmap(ax, scan)
             elif view == 1:
                 shb.plot_scan_max(ax, scan)
+            elif view == 3:
+                shb.plot_scan_measured_finesse(ax, scan)
+            elif view == 4:
+                shb.plot_finesse_written_vs_measured(ax, scan)
             else:
                 _, lines, labels = shb.plot_top_spectra(ax, scan, legend=False)
                 self._populate_legend_panel(lines, labels)
@@ -560,7 +566,7 @@ class LevelsDialog(QDialog):
             [f"g{k}" for k in range(dm.shape[0])])
         for k in range(dm.shape[0]):
             for m in range(dm.shape[1]):
-                self.dm_table.setItem(k, m, QTableWidgetItem(f"{dm[k, m]:g}"))
+                self.dm_table.setItem(k, m, QTableWidgetItem(_fmt_num(dm[k, m])))
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -599,8 +605,9 @@ class LevelsDialog(QDialog):
         vals.sort()
         text = f"{len(vals)} level(s)"
         if len(vals) > 1:
-            spacing = ", ".join(f"{b - a:g}" for a, b in zip(vals, vals[1:]))
-            text += f" - span {vals[-1] - vals[0]:g} MHz - spacing {spacing} MHz"
+            spacing = ", ".join(_fmt_num(b - a) for a, b in zip(vals, vals[1:]))
+            text += (f" - span {_fmt_num(vals[-1] - vals[0])} MHz"
+                     f" - spacing {spacing} MHz")
         return text
 
     def _update_level_info(self, *_):
@@ -612,7 +619,7 @@ class LevelsDialog(QDialog):
         t = QTableWidget(1, len(values))
         t.setVerticalHeaderLabels([""])
         for i, v in enumerate(values):
-            t.setItem(0, i, QTableWidgetItem(f"{v:g}"))
+            t.setItem(0, i, QTableWidgetItem(_fmt_num(v)))
         t.setMaximumHeight(60)
         return t
 
@@ -770,6 +777,11 @@ class PulseSequenceDialog(QDialog):
         alongside - e.g. a shuffle pulse's width/passes next to its on/off
         checkbox - and starts the row hidden unless that field is already
         checked, toggling with it from then on.
+
+        ``decimals`` chooses the *widget* ("bool" -> checkbox, 0 -> integer
+        spin, anything else -> float spin) and sizes the spinner's step; it
+        is no longer the typing precision, which is ``SPIN_DECIMALS`` for
+        every float field.
         """
         self._clear_preset_fields()
         spec = shb.PREP_PRESETS.get(name)
@@ -799,12 +811,13 @@ class PulseSequenceDialog(QDialog):
                     # *approximate* mesh position once inverted to a tooth
                     # spacing - see prep_broadband_afc) aren't MHz fields, so
                     # a df-sized step would be the wrong unit entirely; they
-                    # keep a plain decimal step instead.
+                    # keep a plain decimal step instead. Either way the spec's
+                    # `decimals` only sizes this step - the box itself takes
+                    # SPIN_DECIMALS places whatever the step is.
                     step = (10.0 ** -min(decimals, 3)
                            if kwarg in ("finesse", "storage_time")
                            else max(df, 1e-6))
-                    w = _dspin(-100000.0, 100000.0, step, decimals,
-                              float(value))
+                    w = _dspin(-100000.0, 100000.0, step, float(value))
                 w.valueChanged.connect(lambda *_: self._apply_preset(quiet=True))
             label_w = QLabel(label)
             self._preset_form.addRow(label_w, w)
@@ -1003,8 +1016,8 @@ class PulseSequenceDialog(QDialog):
         self.table.setItem(r, 0, on)
         for c, text in enumerate((
                 str(row.get("label", "stage")),
-                f"{float(row.get('centre', 0.0)):g}",
-                f"{float(row.get('sweep', 0.0)):g}",
+                _fmt_num(row.get("centre", 0.0)),
+                _fmt_num(row.get("sweep", 0.0)),
                 f"{int(row.get('passes') or 0)}"), start=1):
             self.table.setItem(r, c, QTableWidgetItem(text))
         if not quiet:
@@ -1100,8 +1113,88 @@ class PulseSequenceDialog(QDialog):
             })
         return rows
 
-def _dspin(lo, hi, step, decimals, value):
-    s = QDoubleSpinBox()
+
+#: Decimal places every float field accepts. 1e-9 MHz is finer than any mesh
+#: the simulator can build (df bottoms out at 1 kHz), so the limit is
+#: effectively "whatever you can type"; 9 is also what shb._scan_grids rounds
+#: finesse values to when it groups them into heatmap rows, so a box can never
+#: distinguish two values the heatmap would silently merge. Don't raise it:
+#: the widest field range is 1e6, and 7 integer digits + 9 places is already
+#: the last cleanly representable double.
+SPIN_DECIMALS = 9
+
+
+class _PreciseSpinBox(QDoubleSpinBox):
+    """
+    A ``QDoubleSpinBox`` that accepts real precision without displaying it.
+
+    Qt's ``decimals`` is both the input limit and the display format, so the
+    3-decimal fields this replaces could not be given a finer value at all -
+    the extra digits were dropped at the keystroke. Raising ``decimals``
+    alone would pad every field out to its full width ("2.350000000"), so
+    ``textFromValue`` trims the padding back off. The trimmed text is still
+    exactly what Qt's own validator accepts, so typing, stepping and
+    ``interpretText`` are unaffected.
+
+    Nothing here relaxes the mesh invariant: an off-mesh frequency is still
+    rejected by ``shb.to_steps`` when the run starts.
+    """
+
+    def textFromValue(self, v):
+        loc = self.locale()
+        if not self.isGroupSeparatorShown():        # Qt's own default
+            loc.setNumberOptions(loc.numberOptions()
+                                 | QLocale.NumberOption.OmitGroupSeparator)
+        text = loc.toString(float(v), "f", self.decimals())
+        point = loc.decimalPoint()                  # a string, not a char
+        if point in text:
+            text = text.rstrip("0")
+            if text.endswith(point):
+                text = text[:-len(point)]
+        return "0" if text in ("", "-", "-0") else text
+
+    def _hint_pad(self):
+        # Both hints are measured from textFromValue of the range ends,
+        # which now trim to something *narrower* than the 3-decimal boxes
+        # these replace - leave room for a few typed digits instead, or a
+        # squeezed form layout can shrink a field below the number in it.
+        return self.fontMetrics().horizontalAdvance("0000")
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        hint.setWidth(hint.width() + self._hint_pad())
+        return hint
+
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        hint.setWidth(hint.width() + self._hint_pad())
+        return hint
+
+
+def _fmt_num(v, decimals=SPIN_DECIMALS):
+    """
+    A number as table-cell text, to the precision a spin box would hold.
+
+    ``:g`` stops at 6 significant figures, which silently rounded a
+    hand-typed value every time a table was repopulated - a preset
+    re-apply, a dialog reopen - and ``_save_as_preset`` then wrote the
+    rounding to disk. Fixed-point to the same places the boxes accept, with
+    the padding trimmed off, so what a cell shows is exactly what a box
+    could hold and ``float()`` reads it back unchanged. It also keeps the
+    float noise of a computed level (-27.490000000000002) out of the cell,
+    which a shortest-round-trip ``repr`` would not. Anything smaller than
+    the last place - never a frequency, but a dm entry could be - falls
+    back to ``repr``, which round-trips exactly.
+    """
+    v = float(v)
+    text = f"{v:.{decimals}f}".rstrip("0").rstrip(".")
+    if text in ("", "-", "-0"):
+        text = "0"
+    return repr(v) if v and float(text) == 0.0 else text
+
+
+def _dspin(lo, hi, step, value, *, decimals=SPIN_DECIMALS):
+    s = _PreciseSpinBox()
     s.setRange(lo, hi)
     s.setSingleStep(step)
     s.setDecimals(decimals)
@@ -1216,6 +1309,11 @@ class MainWindow(QMainWindow):
         self._norm = None
         self._last_burn = None
         self._scan = None
+        # The params and side-panel session a burn was started with, attached
+        # to its result when it lands (_on_burn_done) - so a later export
+        # saves what actually ran, not whatever the fields say by then.
+        self._burn_params = None
+        self._burn_session = None
 
         self._job_t0 = 0.0
         self._job_estimate = None       # seconds, from run_scan's probe
@@ -1272,7 +1370,7 @@ class MainWindow(QMainWindow):
         for text, slot in [
             ("Import config (.json)...", self._import_config),
             ("Open run folder...", self._open_run_folder),
-            ("Open exported scan (.pkl)...", self._open_scan_pickle),
+            ("Open saved result (.pkl / .npy)...", self._open_saved_result),
             ("Export...", self._open_export),
         ]:
             act = QAction(text, self)
@@ -1320,17 +1418,22 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.addWidget(QLabel("Scan view:"))
         self.scan_view = QComboBox()
+        # Indices are what StackedPlot.show_scan switches on - append new
+        # views rather than inserting, or every `== 2` (top spectra) shifts.
         self.scan_view.addItems(["Comb-quality heatmap",
                                  "Quality vs storage time (best/mean/worst)",
-                                 "Top spectra"])
+                                 "Top spectra",
+                                 "Measured finesse heatmap",
+                                 "Measured vs written finesse"])
         self.scan_view.setEnabled(False)
         self.scan_view.currentIndexChanged.connect(self._draw_feature)
         row.addWidget(self.scan_view)
         self.collect_btn = QPushButton("Collect top spectra")
         self.collect_btn.setToolTip(
-            "Re-burn the best spectra from this run's checkpoint - for a "
-            "cancelled run that never reached the collect pass, or to redo "
-            "it at a different 'keep top N' without resweeping.")
+            "Re-burn the best spectrum at each of the top storage times from "
+            "this run's checkpoint - for a cancelled run that never reached "
+            "the collect pass, or to redo it at a different 'keep top N "
+            "storage times' without resweeping.")
         self.collect_btn.setEnabled(False)
         self.collect_btn.clicked.connect(self._on_collect_top_clicked)
         row.addWidget(self.collect_btn)
@@ -1404,20 +1507,20 @@ class MainWindow(QMainWindow):
         outer = QVBoxLayout(box)
         form = QFormLayout()
 
-        self.fmin = _dspin(-20000, 0, 1.0, 3, -50.0)
-        self.fmax = _dspin(0, 20000, 1.0, 3, 50.0)
-        self.df = _dspin(0.001, 10.0, 0.001, 3, 0.01)
+        self.fmin = _dspin(-20000, 0, 1.0, -50.0)
+        self.fmax = _dspin(0, 20000, 1.0, 50.0)
+        self.df = _dspin(0.001, 10.0, 0.001, 0.01)
         self.df.setToolTip("Mesh step. Must divide the level energies and the "
                            "window edges exactly (0.01, 0.005, 0.001 for the "
                            "default crystal).")
-        self.h_width = _dspin(0.1, 100000.0, 1.0, 3, 1.0)
+        self.h_width = _dspin(0.1, 100000.0, 1.0, 1.0)
         self.h_width.setToolTip("Homogeneous FWHM (Lorentzian), kHz.")
-        self.in_width = _dspin(1.0, 1e6, 100.0, 1, 10000.0)
+        self.in_width = _dspin(1.0, 1e6, 100.0, 10000.0)
         self.in_width.setToolTip("Inhomogeneous FWHM (Gaussian), MHz.")
         self.pump_passes = _ispin(1, 100000, 10)
         self.burn_mode = QComboBox()
         self.burn_mode.addItems(["parallel", "series"])
-        self.alpha = _dspin(0.0, 1e6, 0.1, 3, 1.0)
+        self.alpha = _dspin(0.0, 1e6, 0.1, 1.0)
 
         for w in (self.fmin, self.fmax, self.df, self.h_width, self.in_width):
             w.valueChanged.connect(self._on_params_changed)
@@ -1446,7 +1549,7 @@ class MainWindow(QMainWindow):
         # single hole
         sh = QWidget()
         sh_form = QFormLayout(sh)
-        self.centre = _dspin(-10000, 10000, 1.0, 3, 0.0)
+        self.centre = _dspin(-10000, 10000, 1.0, 0.0)
         self.centre.valueChanged.connect(self._refresh_comb_preview)
         sh_form.addRow("centre (MHz)", self.centre)
         self.stack.addWidget(sh)
@@ -1455,9 +1558,9 @@ class MainWindow(QMainWindow):
         oc = QWidget()
         oc_form = QFormLayout(oc)
         self.tooth_spacing = _dspin(0.001, 1000, max(self.df.value(), 1e-6),
-                                    3, 2.35)
+                                    2.35)
         self.burn_width = _dspin(0.001, 1000, max(self.df.value(), 1e-6),
-                                 3, 1.18)
+                                 1.18)
         self.df.valueChanged.connect(self._sync_comb_steps)
         self.tooth_spacing.valueChanged.connect(self._refresh_comb_preview)
         self.burn_width.valueChanged.connect(self._refresh_comb_preview)
@@ -1471,17 +1574,17 @@ class MainWindow(QMainWindow):
         # scan
         sc = QWidget()
         sc_form = QFormLayout(sc)
-        self.storage_min = _dspin(0.001, 100000, 0.5, 3, 2.0)
-        self.storage_max = _dspin(0.001, 100000, 0.5, 3, 10.0)
+        self.storage_min = _dspin(0.001, 100000, 0.5, 2.0)
+        self.storage_max = _dspin(0.001, 100000, 0.5, 10.0)
         # Capped well below the field's old 1,000,000: `requested` and
         # `results` (shb.run_scan) are both fully materialised lists sized
         # n_points x n_finesse, and a heatmap beyond a couple of thousand
         # cells per axis already exceeds screen resolution.
         self.n_points = _ispin(2, 2000, 40)
-        self.finesse_min = _dspin(1.0, 1000, 0.5, 2, 2.0)
-        self.finesse_max = _dspin(1.0, 1000, 0.5, 2, 20.0)
+        self.finesse_min = _dspin(1.0, 1000, 0.5, 2.0)
+        self.finesse_max = _dspin(1.0, 1000, 0.5, 20.0)
         self.n_finesse = _ispin(1, 2000, 20)
-        self.target_window = _dspin(0.1, 10000, 1.0, 3, 20.0)
+        self.target_window = _dspin(0.1, 10000, 1.0, 20.0)
         self.top_n = _ispin(1, 5000, 50)
         self.parallel_check = QCheckBox("multiprocessing")
         self.parallel_check.setChecked(True)
@@ -1499,7 +1602,30 @@ class MainWindow(QMainWindow):
         sc_form.addRow("finesse max", self.finesse_max)
         sc_form.addRow("finesse points", self.n_finesse)
         sc_form.addRow("target window (MHz)", self.target_window)
-        sc_form.addRow("keep top N", self.top_n)
+        self.top_n.setToolTip(
+            "Keep the best-finesse spectrum at each of this many of the best "
+            "storage times - never two spectra at the same storage time.")
+        sc_form.addRow("keep top N storage times", self.top_n)
+        # Minimum gap between kept storage times: "auto" spreads the N picks
+        # across the scanned range (shb._resolve_storage_sep); 0 turns it off.
+        self.storage_sep_auto = QCheckBox("auto")
+        self.storage_sep_auto.setChecked(True)
+        self.storage_sep = _dspin(0.0, 10000.0, 0.1, 0.0)
+        self.storage_sep.setEnabled(False)
+        self.storage_sep_auto.toggled.connect(
+            lambda on: self.storage_sep.setEnabled(not on))
+        _sep_tip = ("Kept storage times are at least this far apart, so the "
+                    "top spectra are distinct combs rather than near-identical "
+                    "neighbours. 'auto' = (max - min) / (2 N); 0 = off.")
+        self.storage_sep.setToolTip(_sep_tip)
+        self.storage_sep_auto.setToolTip(_sep_tip)
+        sep_row = QHBoxLayout()
+        sep_row.setContentsMargins(0, 0, 0, 0)
+        sep_row.addWidget(self.storage_sep_auto)
+        sep_row.addWidget(self.storage_sep, 1)
+        sep_box = QWidget()
+        sep_box.setLayout(sep_row)
+        sc_form.addRow("min storage separation (us)", sep_box)
         sc_form.addRow(self.parallel_check)
         sc_form.addRow(f"workers (of {_cpu})", self.workers)
 
@@ -1581,8 +1707,8 @@ class MainWindow(QMainWindow):
         self.exp_config = QCheckBox("Simulation config (.json)")
         self.exp_figures = QCheckBox("Figures (.png)")
         self.exp_data = QCheckBox("Data (.npy + .csv)")
-        self.exp_pickle = QCheckBox("Scan pickle (.pkl, for reopening via "
-                                    "File > Open exported scan...)")
+        self.exp_pickle = QCheckBox("Pickle (.pkl, for reopening via "
+                                    "File > Open saved result...)")
         for cb in (self.exp_log, self.exp_config, self.exp_figures,
                    self.exp_data, self.exp_pickle):
             cb.setChecked(True)
@@ -1834,6 +1960,7 @@ class MainWindow(QMainWindow):
                 n_finesse=self.n_finesse.value(),
                 target_window=self.target_window.value(),
                 top_n=self.top_n.value(),
+                min_storage_sep=self._min_storage_sep(),
                 pump_passes=self.pump_passes.value(),
                 burn=(shb.burn_series if self.burn_mode.currentText() == "series"
                       else shb.burn_parallel),
@@ -1855,6 +1982,8 @@ class MainWindow(QMainWindow):
                 self._on_error(str(exc))
                 return
             self._job_kind = "burn"
+            self._burn_params = params
+            self._burn_session = self._collect_session()
             if stages is not None:
                 self._append_log("--- preparation sequence ---")
                 self.request_sequence.emit(params, list(self._sequence_rows),
@@ -1931,6 +2060,11 @@ class MainWindow(QMainWindow):
                 f"probing... ~{fmt_dur(left)} left of ~{fmt_dur(self._job_estimate)}")
 
     def _on_burn_done(self, out):
+        # A fresh burn from the worker carries neither; a reopened one
+        # (_open_saved_result) brings its own, possibly None for an old
+        # spectrum-only export.
+        out.setdefault("params", self._burn_params)
+        out.setdefault("session", self._burn_session)
         self._last_burn = out
         self._scan = None
         self.scan_view.setEnabled(False)
@@ -1975,8 +2109,12 @@ class MainWindow(QMainWindow):
         if self._scan is not None:
             self.plot.show_scan(self._scan, self.scan_view.currentIndex())
         elif self._last_burn is not None:
-            self.plot.show_burn(self._last_burn["pump_freqs"],
-                                self._collect_params(), self._last_burn)
+            # The params the burn ran with, so a reopened result plots on its
+            # own crystal and window; the side panel only for an old
+            # spectrum-only export that saved none.
+            params = self._last_burn.get("params") or self._collect_params()
+            self.plot.show_burn(self._last_burn["pump_freqs"], params,
+                                self._last_burn)
         else:
             self._refresh_comb_preview()
 
@@ -1985,6 +2123,12 @@ class MainWindow(QMainWindow):
     _GUI_FIELDS = ("centre", "tooth_spacing", "burn_width", "storage_min",
                    "storage_max", "finesse_min", "finesse_max", "target_window")
     _GUI_INTS = ("n_points", "n_finesse", "top_n", "workers")
+
+    def _min_storage_sep(self):
+        """The scan's ``min_storage_sep``: ``"auto"`` or the gap in us."""
+        if self.storage_sep_auto.isChecked():
+            return "auto"
+        return self.storage_sep.value()
 
     def _collect_session(self):
         gui = {
@@ -1999,6 +2143,7 @@ class MainWindow(QMainWindow):
             "sequence": [dict(r) for r in self._sequence_rows],
             "prep_preset": self._last_prep_preset,
             "prep_fields": self._last_prep_fields,
+            "min_storage_sep": self._min_storage_sep(),
         }
         for name in self._GUI_FIELDS:
             gui[name] = getattr(self, name).value()
@@ -2042,6 +2187,12 @@ class MainWindow(QMainWindow):
         for name in self._GUI_INTS:
             if name in gui:
                 getattr(self, name).setValue(int(gui[name]))
+        if "min_storage_sep" in gui:
+            sep = gui["min_storage_sep"]
+            auto = sep in (None, "auto")
+            self.storage_sep_auto.setChecked(auto)
+            if not auto:
+                self.storage_sep.setValue(float(sep))
         if isinstance(gui.get("sequence"), list):
             self._sequence_rows = [dict(r) for r in gui["sequence"]]
         if gui.get("prep_preset"):
@@ -2192,7 +2343,8 @@ class MainWindow(QMainWindow):
             return
         sim_dir = self._scan["sim_dir"]
         try:
-            shb.collect_top(sim_dir, top_n=self.top_n.value())
+            shb.collect_top(sim_dir, top_n=self.top_n.value(),
+                            min_storage_sep=self._min_storage_sep())
             scan = shb.load_run(sim_dir)
         except Exception as exc:                        # noqa: BLE001
             self._on_error(str(exc))
@@ -2204,13 +2356,38 @@ class MainWindow(QMainWindow):
     def _open_run_folder(self):
         path = self._file_dialog("Open a simulation folder",
                                  self._sim_root or os.getcwd())
-        if not path:
-            return
+        if path:
+            self._open_result(path)
+
+    def _open_saved_result(self):
+        """
+        Reopen a saved result file - a scan or burn pickle from the Export
+        tab, an old notebook ``results_*.pkl``, or an older ``*_spectrum.npy``
+        export (see shb.load_result) - and plot it as if it had just run.
+        """
+        path = self._file_dialog("Open a saved result",
+                                 self._sim_root or os.getcwd(),
+                                 directory=False,
+                                 name_filter="Saved results (*.pkl *.npy)")
+        if path:
+            self._open_result(path)
+
+    def _open_result(self, path):
         try:
-            scan = shb.load_run(path)
+            kind, data = shb.load_result(path)
         except Exception as exc:                        # noqa: BLE001
             self._on_error(f"could not read {path}: {exc}")
             return
+        if kind == "burn":
+            self._open_burn(path, data)
+        elif os.path.isdir(path):
+            self._open_scan_folder(path, data)
+        else:
+            self._append_log(f"opened {path}: {len(data['best'])} top "
+                             f"spectra, {len(data['results'])} grid cells")
+            self._on_scan_done(data)
+
+    def _open_scan_folder(self, path, scan):
         cfg_path = os.path.join(path, "config.json")
         if os.path.exists(cfg_path):
             try:
@@ -2225,33 +2402,26 @@ class MainWindow(QMainWindow):
                          f"{scan['n_done']}/{scan['n_total']} burns")
         self._on_scan_done(scan)
 
-    def _open_scan_pickle(self):
-        """
-        Load a standalone `*_scan.pkl` (written by the Export tab) back into
-        the plot - for a scan whose sim_dir has since been moved, archived,
-        or deleted, so "Open run folder..." no longer applies.
-        """
-        path = self._file_dialog("Open an exported scan",
-                                 self._sim_root or os.getcwd(),
-                                 directory=False, name_filter="Scan pickle (*.pkl)")
-        if not path:
-            return
-        try:
-            with open(path, "rb") as fh:
-                scan = pickle.load(fh)
-            if not isinstance(scan, dict) or "results" not in scan or "best" not in scan:
-                raise ValueError("not an exported scan - missing 'results'/'best'")
-        except Exception as exc:                        # noqa: BLE001
-            self._on_error(f"could not read {path}: {exc}")
-            return
-        # sim_dir is whatever was live when this was exported - drop it if
-        # that folder is gone, so the export hint / Collect button don't
-        # point at a path that no longer exists.
-        if scan.get("sim_dir") and not os.path.isdir(scan["sim_dir"]):
-            scan["sim_dir"] = None
-        self._append_log(f"opened {path}: {len(scan['best'])} top spectra, "
-                         f"{len(scan['results'])} grid cells")
-        self._on_scan_done(scan)
+    def _open_burn(self, path, out):
+        # Restore the side panel first: _apply_session redraws the preview,
+        # which _on_burn_done then replaces with the reopened spectrum.
+        if out.get("session"):
+            try:
+                self._apply_session(out["session"])
+            except Exception as exc:                     # noqa: BLE001
+                self._append_log(f"! could not restore session: {exc}")
+        elif out.get("params"):
+            try:
+                self._apply_session({"params": out["params"]})
+            except Exception as exc:                     # noqa: BLE001
+                self._append_log(f"! could not restore params: {exc}")
+        self._sim_root = os.path.dirname(path) or self._sim_root
+        stages = out.get("stages")
+        what = (f"{len(stages)} stage(s)" if stages
+                else f"{len(out['pump_freqs'])} pump frequencies"
+                if len(out["pump_freqs"]) else "spectrum only")
+        self._append_log(f"opened {path}: {what}")
+        self._on_burn_done(out)
 
     def _refresh_export_enabled(self):
         have = self._last_burn is not None or self._scan is not None
@@ -2340,22 +2510,36 @@ class MainWindow(QMainWindow):
                 # at the end of the loop's next iteration - releases it
                 # immediately rather than at the next figure's construction.
                 fig = Figure(figsize=(8, 4), constrained_layout=True)
-                for name, fn in (("heatmap", shb.plot_scan_heatmap),
-                                 ("quality_vs_storage", shb.plot_scan_max),
-                                 ("topspectra", shb.plot_top_spectra)):
+                for name, fn in shb.SCAN_FIGURES:
                     fig.clear()
-                    fn(fig.add_subplot(111), self._scan)
+                    try:
+                        fn(fig.add_subplot(111), self._scan)
+                    except ValueError as exc:
+                        # A scan saved before measured finesse was recorded
+                        # has nothing to draw for those two views - skip
+                        # them rather than abort the rest of the export.
+                        self._append_log(f"  skipped {name}.png: "
+                                         f"{' '.join(str(exc).split())}")
+                        continue
                     fig.savefig(f"{base}_{name}.png", dpi=300)
                     note(f"{base}_{name}.png")
                 del fig
+                # And one image per kept spectrum, in its own subfolder -
+                # listed once as the folder, not once per image, so the
+                # "Export complete" box stays readable at a large top N.
+                top_dir = f"{base}_top_spectra"
+                n_img = len(shb.save_top_spectrum_figures(
+                    self._scan, top_dir, dpi=300))
+                if n_img:
+                    written.append(top_dir)
+                    self._append_log(f"  wrote {n_img} spectrum image(s) to "
+                                     f"{os.path.basename(top_dir)}/")
 
         if self.exp_data.isChecked():
             if self._scan is not None:
                 path = f"{base}_results.csv"
-                cols = ["spacing_MHz", "width_MHz", "finesse",
-                        "storage_us", "quality"]
                 with open(path, "w", newline="") as fh:
-                    w = csv.DictWriter(fh, fieldnames=cols)
+                    w = csv.DictWriter(fh, fieldnames=shb.RESULTS_COLUMNS)
                     w.writeheader()
                     w.writerows(self._scan["results"])
                 note(path)
@@ -2392,6 +2576,14 @@ class MainWindow(QMainWindow):
                     w.writerow(["frequency_MHz", "absorption"])
                     w.writerows(zip(out["f"].tolist(), out["spec"].tolist()))
                 note(path)
+                if self.exp_pickle.isChecked():
+                    path = f"{base}_burn.pkl"
+                    shb.save_burn(
+                        path, out,
+                        out.get("params") or self._collect_params(),
+                        session=(out.get("session")
+                                 or self._collect_session()))
+                    note(path)
 
         return written
 

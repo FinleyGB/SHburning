@@ -32,6 +32,7 @@ import csv
 import hashlib
 import json
 import os
+import pickle
 import socket
 import sys
 import tempfile
@@ -80,9 +81,12 @@ __all__ = [
     "resolve_teams_webhook", "notify_teams", "scan_teams_notifier",
     # checkpointing / simulation folders
     "load_run", "inspect_run", "collect_top", "write_run_outputs",
+    "RESULTS_COLUMNS",
     # plotting (matplotlib, draw onto an Axes)
     "plot_spectrum", "plot_comb", "plot_sequence", "plot_populations",
-    "plot_scan_heatmap", "plot_scan_max", "plot_top_spectra",
+    "plot_scan_heatmap", "plot_scan_measured_finesse",
+    "plot_finesse_written_vs_measured", "plot_scan_max", "plot_top_spectra",
+    "plot_top_spectrum", "save_top_spectrum_figures", "SCAN_FIGURES",
     # plotting (plotly, return a Figure)
     "plot_spectrum_plotly", "plot_scan_heatmap_plotly",
     "plot_scan_max_plotly", "plot_top_spectra_plotly",
@@ -205,7 +209,7 @@ DEFAULT_PARAMS = _default_params()
 # function). It goes into every simulation folder's manifest, so a resume
 # against an old checkpoint is refused rather than silently mixing two
 # versions of the metric into one results table.
-QUALITY_VERSION = 2
+QUALITY_VERSION = 3
 
 
 def _preset(g, e, dm, h_width, in_width, fmin, fmax, df):
@@ -235,6 +239,15 @@ PRESETS = {
         g=[0.0, -10.2, -27.5], e=[0.0, 4.6, 9.4],
         dm=np.full((3, 3), 1 / 3), h_width=0.02, in_width=2000.0,
         fmin=-200.0, fmax=200.0, df=0.02),
+
+    # 1.4% Pr:La2(WO4)3 - not from the MATLAB source: hyperfine levels and
+    # linewidths (25.3 kHz homogeneous, 18.8 GHz inhomogeneous) supplied
+    # directly; dm is a uniform placeholder until a measured branching matrix
+    # is available. df = 0.01 is the coarsest mesh dividing the levels.
+    "1.4% Pr:LaWO": _preset(
+        g=[0.0, -14.87, -39.31], e=[0.0, 4.94, 12.17],
+        dm=np.full((3, 3), 1 / 3), h_width=0.0253, in_width=18800.0,
+        fmin=-100.0, fmax=100.0, df=0.01),
 
     "151Eu:YSO (site 1)": _preset(
         g=[0.0, -34.5, -80.7], e=[0.0, 75.0, 176.6],
@@ -813,16 +826,43 @@ def single_hole(centre=0.0):
 def comb(spacing_steps, width_steps, params):
     """
     Teeth every ``spacing_steps`` bins across the spectrum window, each tooth
-    ``width_steps`` bins wide. Arguments are in whole df steps.
+    ``width_steps`` bins wide. ``width_steps`` is a whole number of df steps.
+
+    ``spacing_steps`` may be fractional (see :func:`period_steps`): tooth ``i``
+    then starts at ``round(i * spacing_steps)``, so every tooth sits on the
+    mesh, its position off by at most half a step, while the *mean* period -
+    which is what sets the echo time - is exactly ``spacing_steps``. A whole
+    ``spacing_steps`` gives the plain, perfectly regular comb, unchanged.
     """
     p = settings(params)
     df = p["df"]
     f0 = int(to_steps(p["fmin"], df))
     f1 = int(to_steps(p["fmax"], df))
 
-    n_teeth = (f1 - f0) // spacing_steps + 1
-    starts = f0 + spacing_steps * np.arange(n_teeth)
+    n_teeth = int((f1 - f0) // spacing_steps) + 1
+    starts = f0 + np.rint(spacing_steps * np.arange(n_teeth)).astype(int)
     return df * (starts[:, None] + np.arange(width_steps)[None, :]).ravel()
+
+
+def period_steps(storage_time, df):
+    """
+    The AFC tooth period, in df steps, for a storage time of ``storage_time``
+    us: ``1 / (storage_time * df)``.
+
+    Not rounded to a whole step - the mesh only offers storage times
+    ``1 / (k * df)``, which bunch up at short storage times and spread out at
+    long ones (the gap grows as ``t**2 * df``), so rounding the period would
+    sample a linear grid of storage times unevenly. :func:`comb` burns a
+    fractional period exactly on average instead. A period within ``1e-6`` of
+    a whole step snaps to that ``int``, so an on-mesh storage time burns the
+    same perfectly regular comb (and checkpoints under the same key) as it
+    always has. Never below one step.
+    """
+    s = 1.0 / (float(storage_time) * float(df))
+    k = round(s)
+    if abs(s - k) < 1e-6:
+        return int(max(1, k))
+    return max(1.0, s)
 
 
 def comb_at(tooth_spacing, burn_width, params):
@@ -1366,7 +1406,9 @@ def prep_broadband_afc(params, *, width=100.0, storage_time=2.0, finesse=2.0,
 #: e.g. a shuffle pulse's width/passes next to its on/off checkbox; the GUI
 #: hides such a field until its named field is checked. A callable default is
 #: resolved against the current params, ``decimals=0`` means an integer
-#: field, and ``decimals="bool"`` means a checkbox.
+#: field, and ``decimals="bool"`` means a checkbox. For a float field
+#: ``decimals`` only sizes the editor's spinner step - how many places can be
+#: *typed* is the editor's own ``SPIN_DECIMALS``, not this.
 #:
 #: Every builder shares the same shuffle-pulse kwargs (``shuffle``,
 #: ``shuffle_centre``, ``shuffle_sweep``, ``shuffle_passes`` - see
@@ -1587,22 +1629,70 @@ def _peak_prominences_1d(x, peak_idx):
     return proms
 
 
+def _measured_finesse(template):
+    """
+    The finesse a comb *actually* has, read off one averaged tooth period.
+
+    ``template`` is one period of the spectrum (periods averaged together, as
+    :func:`_score_quality` builds it). The tooth's FWHM is taken as the number
+    of samples above half height - halfway between the template's floor and
+    its peak - so the measured finesse is ``F_a = len(template) / n_above``.
+    Counting samples rather than locating edges makes this circular: it does
+    not matter where in the period the tooth sits, or whether it wraps round
+    the period boundary. Returns ``nan`` for a flat template (no tooth).
+
+    This is the finesse the comb was burned *into*, not the one it was written
+    with: power broadening, the hole's own homogeneous width and side-hole
+    refilling all spread the teeth, so a comb written at ``F = 10`` routinely
+    comes out near ``F = 2``.
+    """
+    template = np.asarray(template, dtype=float)
+    lo, hi = float(template.min()), float(template.max())
+    if hi <= lo:
+        return float("nan")
+    n_above = int(np.count_nonzero(template > 0.5 * (lo + hi)))
+    return template.size / max(n_above, 1)
+
+
+def _score_quality(f, spec, target_window, spacing_mhz, width_mhz=None):
+    """
+    AFC comb-quality score over ``target_window`` MHz at the centre of ``f``.
+    The score alone - see :func:`_score_quality_and_finesse` for the formula,
+    and for the comb's measured finesse alongside it.
+    """
+    return _score_quality_and_finesse(f, spec, target_window, spacing_mhz,
+                                      width_mhz)[0]
+
+
 # NOTE: this function is still being tuned (see the git history) - bump
 # QUALITY_VERSION above whenever its formula changes, or a resumed scan will
 # silently mix qualities computed two different ways into one results table.
-def _score_quality(f, spec, target_window, spacing_mhz):
+# _measured_finesse feeds finesse_match, so changing it is a formula change
+# too (and it also changes the measured_finesse column a scan records).
+def _score_quality_and_finesse(f, spec, target_window, spacing_mhz,
+                               width_mhz=None):
     """
-    AFC comb-quality score over ``target_window`` MHz at the centre of ``f``.
+    AFC comb-quality score over ``target_window`` MHz at the centre of ``f``,
+    and the finesse the comb actually came out with.
+
+    Returns ``(quality, F_a)``. ``F_a`` is :func:`_measured_finesse` of the
+    averaged one-period template the score builds anyway, so a scan gets it
+    for free rather than re-cropping the spectrum; it is ``nan`` wherever there
+    is no template to read it from (fewer than two whole periods in the window,
+    no spacing given, or a flat segment). Measured whether or not
+    ``width_mhz`` is given - only the ``finesse_match`` factor needs that.
 
     A clean broadband AFC has regular, equal-height teeth with deep flat dips
     and a single flat-topped bump per period; a bad one has irregular teeth,
     ringing / sub-structure inside a tooth, or aperiodic drift between
     periods. A plain Michelson visibility ``(A_max - A_min) / (A_max + A_min)``
     cannot tell them apart - both hit the same extreme samples. This score
-    multiplies four factors, each in ``[0, 1]``, so a comb has to be deep,
-    regular, periodic *and* square to score well::
+    multiplies six factors, each in ``[0, 1]``, so a comb has to be deep,
+    regular, periodic, square, empty between its teeth *and* as fine as it was
+    written to score well::
 
         Q = mean_j(v_j) * uniformity * periodicity * squareness
+            * background * finesse_match
 
     where the window is cropped to a whole number of tooth periods
     (``spacing_mhz`` is the known tooth spacing, so ``per = spacing_mhz / df`` is
@@ -1631,11 +1721,35 @@ def _score_quality(f, spec, target_window, spacing_mhz):
       ``_SQUARENESS_PROMINENCE_FRAC`` of the template's own range - see
       :func:`_peak_prominences_1d`); a clean tooth has exactly one dominant
       feature, so the largest is exempted and every other peak/dip's
-      prominence is charged against the score.
+      prominence is charged against the score;
+    * ``background = exp(-d0)`` charges the absorption left *between* the
+      teeth. Every term above is a ratio (``v_j`` sees only ``d0 / d``), so a
+      comb whose antihole teeth grew tall enough could hide half-refilled gaps.
+      But gap absorption is absolute loss - it takes up input light that is
+      never rephased - and AFC theory carries it as a separate
+      ``eta ~ exp(-d0)`` factor (Afzelius et al., PRA 79, 052329 (2009)).
+      ``d0`` is the mean of every sample below half height in each period
+      (then averaged over periods), not the per-period floor, so a sloped or
+      partly refilled gap and the teeth's Lorentzian tails all count. The
+      spectrum is in ``alpha`` units (the unburned crystal sits at ``alpha``),
+      so this is the physical ``exp(-d0)`` only when ``alpha`` is set to the
+      crystal's real optical depth; at the default ``alpha = 1`` it is still
+      monotonic in how far the gaps have refilled;
+    * ``finesse_match = min(F_a, F_w) / max(F_a, F_w)`` compares the finesse
+      the comb was written with, ``F_w = spacing_mhz / width_mhz``, to the one
+      it actually came out with, ``F_a`` (:func:`_measured_finesse`, from the
+      half-height duty cycle of the averaged period). Broadening routinely
+      spreads a comb written at ``F = 10`` to ``F ~ 2``; the scan's finesse
+      axis is ``F_w``, so without this factor a cell would be credited with a
+      finesse its comb does not have. Skipped (``1``) when ``width_mhz`` is
+      not given.
 
     With fewer than two whole periods in the window there is no comb to speak of
-    and the score falls back to the robust whole-window depth alone.
+    and the score falls back to the robust whole-window depth times
+    ``exp(-p05)`` (the window floor standing in for ``d0``); there is no whole
+    period to measure a finesse from.
     """
+    nan = float("nan")
     f = np.asarray(f)
     spec = np.asarray(spec, dtype=float)
     centre = f[len(f) // 2]
@@ -1644,20 +1758,30 @@ def _score_quality(f, spec, target_window, spacing_mhz):
     seg = spec[lo:hi]
     fseg = f[lo:hi]
     if seg.size == 0:
-        return 0.0
+        return 0.0, nan
 
     p05, p95 = np.percentile(seg, [5.0, 95.0])
     if p95 + p05 <= 0.0:
-        return 0.0
+        return 0.0, nan
     depth = float(np.clip((p95 - p05) / (p95 + p05), 0.0, 1.0))
+    depth *= float(np.exp(-max(float(p05), 0.0)))      # background, see docstring
 
     df_seg = float(fseg[1] - fseg[0]) if fseg.size >= 2 else 0.0
     if not (spacing_mhz and spacing_mhz > 0.0 and df_seg > 0.0):
-        return depth
-    per = int(round(spacing_mhz / df_seg))            # == spacing_steps (exact)
+        return depth, nan
+    per_f = spacing_mhz / df_seg
+    per = int(round(per_f))                           # == spacing_steps
+    if per >= 2 and abs(per_f - per) > 1e-6:
+        # A fractional period (see period_steps): resample the window onto a
+        # grid of exactly ``per`` samples per period, so the reshape below
+        # still lines periods up instead of drifting by up to half a step a
+        # period. A whole period skips this, so its score is unchanged.
+        step = spacing_mhz / per
+        x = fseg[0] + step * np.arange(int((fseg[-1] - fseg[0]) / step) + 1)
+        seg = np.interp(x, fseg, seg)
     n_per = seg.size // per if per > 0 else 0
     if per < 2 or n_per < 2:                          # < 2 teeth in the window
-        return depth
+        return depth, nan
 
     keep = n_per * per
     s = seg[:keep]
@@ -1671,13 +1795,21 @@ def _score_quality(f, spec, target_window, spacing_mhz):
     uniformity = (1.0 - float(v_j.std()) / mean_v) if mean_v > 0.0 else 0.0
     uniformity = float(np.clip(uniformity, 0.0, 1.0))
 
+    # background: absolute absorption left in the gaps (mean below half height)
+    gap = chunks < 0.5 * (lo_j + hi_j)[:, None]
+    n_gap = gap.sum(axis=1)
+    d0_j = np.where(n_gap > 0,
+                    np.where(gap, chunks, 0.0).sum(axis=1) / np.maximum(n_gap, 1),
+                    lo_j)
+    background = float(np.exp(-max(float(d0_j.mean()), 0.0)))
+
     # periodicity: AC power fraction sitting at harmonics of the comb's
     # fundamental frequency (not just the fundamental itself - see docstring)
     g = s - s.mean()
     power = np.abs(np.fft.rfft(g)) ** 2
     total_power = float(power[1:].sum())               # drop DC (index 0)
     if total_power <= 0.0:
-        return 0.0
+        return 0.0, nan                                # flat: no tooth to measure
     harmonics = np.arange(n_per, power.size, n_per)
     periodicity = float(np.clip(power[harmonics].sum() / total_power, 0.0, 1.0))
 
@@ -1697,7 +1829,17 @@ def _score_quality(f, spec, target_window, spacing_mhz):
         excess = float(proms.sum() - proms.max()) if proms.size else 0.0
         squareness = float(np.clip(1.0 - excess / template_range, 0.0, 1.0))
 
-    return float(np.clip(mean_v * uniformity * periodicity * squareness, 0.0, 1.0))
+    # finesse_match: written finesse vs the finesse the comb actually has
+    f_a = _measured_finesse(template)
+    finesse_match = 1.0
+    if width_mhz and width_mhz > 0.0:
+        f_w = spacing_mhz / width_mhz
+        finesse_match = (min(f_a, f_w) / max(f_a, f_w)
+                         if np.isfinite(f_a) else 0.0)
+
+    return (float(np.clip(mean_v * uniformity * periodicity * squareness
+                          * background * finesse_match, 0.0, 1.0)),
+            float(f_a))
 
 
 def _estimate_worker_bytes(params, min_finesse=1.0):
@@ -1788,10 +1930,12 @@ def _resolve_scan_df(t_targets, params, finesse_min):
     """
     The df a scan actually burns at, after auto-refinement.
 
-    Tooth spacing is 1/t, quantised to df, so two close storage times can
-    round to the same comb; this refines df by a whole factor (so it still
-    divides the crystal levels and the window edges) until consecutive
-    spacings are at least one step apart - bounded below by what is
+    Tooth spacing is 1/t, burned as a fractional period on the df mesh
+    (:func:`period_steps`), so every storage time gets its own comb, but each
+    tooth sits up to half a step off its ideal position. This refines df by a
+    whole factor (so it still divides the crystal levels and the window edges)
+    until consecutive spacings are at least one step apart, which keeps that
+    jitter below the difference between neighbouring combs - bounded below by what is
     physically meaningful (~h_width/5), by a cap on the spectrum array size,
     and by what a worker can hold in memory.
 
@@ -1875,12 +2019,15 @@ def compute_one(item, params=None, burn=None, pump_passes=None,
     ``quality`` is the AFC comb-quality score (:func:`_score_quality`).
 
     With ``want_spec=False`` the record is the short form
-    ``(quality, n, spacing_MHz, width_MHz)`` - no spectrum, no frequency axis.
-    That is what a scan sweep uses: a spectrum and its axis are ~1.6 MB at
-    df 0.001, so returning them for every point pickles gigabytes back into the
-    parent process to keep a few dozen. :func:`run_scan` recomputes the
-    winners' spectra afterwards instead. The default is ``True`` so the
-    notebooks still get the six-tuple.
+    ``(quality, n, spacing_MHz, width_MHz, measured_finesse)`` - no spectrum,
+    no frequency axis. That is what a scan sweep uses: a spectrum and its axis
+    are ~1.6 MB at df 0.001, so returning them for every point pickles
+    gigabytes back into the parent process to keep a few dozen.
+    :func:`run_scan` recomputes the winners' spectra afterwards instead.
+    ``measured_finesse`` is the finesse the comb actually came out with
+    (:func:`_measured_finesse`, ``nan`` where there is no whole period to read
+    it from) - one float, read off the template the score builds anyway. The
+    default is ``True`` so the notebooks still get the six-tuple.
 
     Pass ``ctx`` (from :func:`_scan_context`) for the fast path: the transition
     table, axes, initial populations and spectrum FFT setup are reused instead of
@@ -1905,13 +2052,14 @@ def compute_one(item, params=None, burn=None, pump_passes=None,
     spacing_mhz = spacing_steps * df
     width_mhz = width_steps * df
 
-    quality = _score_quality(f, spec, target_window, spacing_mhz)
+    quality, f_meas = _score_quality_and_finesse(f, spec, target_window,
+                                                 spacing_mhz, width_mhz)
 
     result_row = (spacing_mhz, width_mhz, quality)
     if want_spec:
         record = (quality, n, spec, spacing_mhz, width_mhz, f)
     else:
-        record = (quality, n, spacing_mhz, width_mhz)
+        record = (quality, n, spacing_mhz, width_mhz, f_meas)
     return result_row, record
 
 
@@ -1986,19 +2134,86 @@ def _target_match(t_target, f_target, spacing_mhz, width_mhz):
     return float(np.clip(1.0 - t_err, 0.0, 1.0) * np.clip(1.0 - f_err, 0.0, 1.0))
 
 
+def _resolve_storage_sep(min_storage_sep, storage_min, storage_max, top_n):
+    """
+    The minimum gap (us) between the storage times a scan keeps spectra for.
+
+    ``"auto"`` (or ``None``) spreads ``top_n`` picks across the scanned range:
+    ``(storage_max - storage_min) / (2 * top_n)``. Each kept storage time
+    excludes everything within one gap either side of it, so ``top_n`` picks
+    together cover about the whole range - enough room for all of them
+    without letting them cluster on one quality ridge. A number is taken as
+    the gap itself; ``0`` turns the rule off (best storage times, however
+    close together).
+    """
+    if min_storage_sep is None or min_storage_sep == "auto":
+        return (float(storage_max) - float(storage_min)) / (2.0 * max(1, top_n))
+    sep = float(min_storage_sep)
+    if not sep >= 0.0:
+        raise ValueError(f"min_storage_sep must be 'auto' or >= 0 us, "
+                         f"not {min_storage_sep!r}")
+    return sep
+
+
+def _best_per_storage(scored, uniq, top_n, df=None, min_sep_us=0.0):
+    """
+    Pick the spectra a scan keeps: the best comb at each storage time, for the
+    ``top_n`` best storage times that sit at least ``min_sep_us`` apart.
+
+    ``scored`` is an iterable of ``(quality, n)`` pairs, ``n`` indexing
+    ``uniq``'s ``(s_steps, w_steps)`` keys. "Storage time" here is the tooth
+    spacing actually burned, ``s_steps`` - two requested storage times that
+    snap to the same mesh spacing are the same comb - so the kept set never
+    holds two spectra at one storage time, only the best finesse at each.
+    Ranked on the raw comb quality (no :func:`_target_match`), since this
+    ranks burned combs, not requested cells.
+
+    Neighbouring storage times on a fine grid score almost alike, so the plain
+    top ``top_n`` tends to be one cluster around the best. With
+    ``min_sep_us > 0`` (``df`` then required, to turn ``s_steps`` back into
+    us) the pick is greedy, best first: a storage time is skipped if it lies
+    closer than ``min_sep_us`` to one already kept. That can leave fewer than
+    ``top_n`` picks when the gap is wide for the range.
+
+    Returns ``(quality, n)`` pairs, best first, at most ``top_n`` of them.
+    Shared by :func:`run_scan` and :func:`collect_top` so the two always agree.
+    """
+    per_s = {}               # s_steps -> (quality, n)
+    for key in scored:
+        s = uniq[key[1]][0]
+        if s not in per_s or key > per_s[s]:
+            per_s[s] = key
+    ranked = sorted(per_s.values(), reverse=True)
+    if not min_sep_us:
+        return ranked[:top_n]
+    kept, kept_t = [], []
+    for key in ranked:
+        t = 1.0 / (uniq[key[1]][0] * df)
+        # The small slack keeps a gap that is exactly one grid step from
+        # being rejected by floating-point noise.
+        if all(abs(t - tk) >= min_sep_us * (1.0 - 1e-9) for tk in kept_t):
+            kept.append(key)
+            kept_t.append(t)
+            if len(kept) == top_n:
+                break
+    return kept
+
+
 def run_scan(storage_min, storage_max, n_points,
              finesse_min, finesse_max, n_finesse,
              target_window, top_n, pump_passes,
              params=None, burn=burn_parallel,
              parallel=True, n_workers=None, maxtasksperchild=None,
              progress=None, log=None, estimate=None, on_done=None,
-             sim_dir=None, resume=True, checkpoint_every=10):
+             sim_dir=None, resume=True, checkpoint_every=10,
+             min_storage_sep="auto"):
     """
     Sweep AFC storage time and comb finesse, scoring each spectrum by its AFC
     comb-quality score (:func:`_score_quality`) over a window at the centre -
     per-period depth times tooth-to-tooth uniformity times periodicity times
-    squareness, so a clean regular comb outranks a deep-but-messy one at any
-    finesse.
+    squareness times gap background ``exp(-d0)`` times the match between the
+    written and the measured finesse, so a clean regular comb with empty gaps
+    that holds its written finesse outranks a deep-but-messy one.
 
     The spectrum window and mesh come from ``params`` - fmin, fmax and df are
     not swept here.
@@ -2007,20 +2222,33 @@ def run_scan(storage_min, storage_max, n_points,
                       ``1 / storage_time`` (MHz), so this range corresponds to
                       spacings ``1/storage_max .. 1/storage_min``.
     n_points          number of storage times across that range, spaced linearly
-                      in us; each is converted to a spacing and rounded to the df
-                      mesh (so any n_points works - there is no step that has to
-                      divide df)
+                      in us - and burned at exactly those storage times: each
+                      comb's mean tooth period is 1/t, as a fractional number
+                      of df steps (see :func:`period_steps` / :func:`comb`), so
+                      long storage times are sampled as evenly as short ones
+                      and any n_points works
     finesse_min/max   range of comb finesse F = tooth_spacing / tooth_width
     n_finesse         number of finesse values across that range
     target_window     judge each spectrum over this width at the centre (MHz).
                       ``None`` -> 4 / storage_min, so the window always holds
                       several teeth however wide the spacing gets.
-    top_n             how many of the best spectra to keep for plotting.
-                      The sweep itself carries only scores; these spectra are
-                      recomputed in a short collect pass once the winners are
-                      known, which costs about ``top_n / unique burns`` extra
-                      time and keeps the sweep's memory flat. Clamped to the
-                      number of unique burns.
+    top_n             how many storage times to keep a spectrum for, for
+                      plotting: the best-finesse comb at each storage time,
+                      for the ``top_n`` best storage times (see
+                      :func:`_best_per_storage`) - never two spectra at the
+                      same storage time. The sweep itself carries only scores;
+                      these spectra are recomputed in a short collect pass once
+                      the winners are known, which costs about
+                      ``top_n / unique burns`` extra time and keeps the sweep's
+                      memory flat. Clamped to the number of distinct (mesh-
+                      snapped) storage times.
+    min_storage_sep   minimum gap (us) between the kept storage times, so the
+                      top spectra are distinct combs rather than one cluster
+                      of near-identical neighbours. ``"auto"`` (default)
+                      spreads them across the range -
+                      ``(storage_max - storage_min) / (2 * top_n)``, see
+                      :func:`_resolve_storage_sep`; ``0`` turns it off. A wide
+                      gap can leave fewer than ``top_n`` spectra kept.
     parallel          run the sweep across a multiprocessing.Pool (default True)
     n_workers         processes to use when ``parallel`` (default one fewer than
                       os.cpu_count(), to leave the machine responsive)
@@ -2068,9 +2296,17 @@ def run_scan(storage_min, storage_max, n_points,
         tag            short label for the run
         results        one dict per requested (storage, finesse) cell that was
                        actually burned: spacing_MHz, width_MHz, finesse,
-                       storage_us, quality. A cancelled or crashed run simply
-                       omits the cells it never reached.
-        best           top_n dicts by quality, each also carrying spec, f, n
+                       storage_us, quality, measured_finesse. ``finesse`` is
+                       the requested (written) value, the heatmap's axis;
+                       ``measured_finesse`` is what the burned comb actually
+                       came out with (:func:`_measured_finesse` - typically
+                       far lower once broadening spreads the teeth; ``nan``
+                       when unmeasurable, or for a cell resumed from a
+                       checkpoint written before the column existed). A
+                       cancelled or crashed run simply omits the cells it
+                       never reached.
+        best           up to top_n dicts, one per storage time (its best
+                       finesse), best first; each also carrying spec, f, n
         params, finesse_vals, target_window, pump_passes, metric
         sim_dir, state, n_done, n_total, n_missing, resumed_from
                        state is "complete", "cancelled" or "failed"
@@ -2084,16 +2320,19 @@ def run_scan(storage_min, storage_max, n_points,
 
     if target_window is None:
         target_window = 4.0 / storage_min
+    _resolve_storage_sep(min_storage_sep, storage_min, storage_max, 1)
 
-    # The scan grid is linear in storage time and in finesse. Each (t, F) cell
-    # keeps its requested t and F (so the heatmap axes are evenly spaced); the
-    # burn behind it uses the tooth spacing 1/t rounded to the mesh.
+    # The scan grid is linear in storage time and in finesse, and so is what
+    # gets burned: each (t, F) cell's comb has a mean tooth period of exactly
+    # 1/t (period_steps - fractional, each tooth snapped to the mesh), not 1/t
+    # rounded to a whole step, which would bunch the storage times actually
+    # burned towards short t and leave ever wider gaps at long t.
     t_targets = np.linspace(storage_min, storage_max, max(2, int(n_points)))
     finesse_vals = np.linspace(finesse_min, finesse_max, max(1, int(n_finesse)))
 
-    # Tooth spacing is 1/t, quantised to the df mesh, so two close storage times
-    # can round to the same comb - refined by _resolve_scan_df (see there for
-    # the bounds this is subject to).
+    # A fractional period puts each tooth up to half a step off its ideal
+    # position; refining df (_resolve_scan_df - see there for the bounds) keeps
+    # that jitter below the spacing between neighbouring storage times.
     df, _capped_by_memory = _resolve_scan_df(t_targets, params, finesse_min)
 
     scan_params = params
@@ -2106,10 +2345,10 @@ def run_scan(storage_min, storage_max, n_points,
     todo = {}               # (s_steps, w_steps) -> index
     distinct_spacings = set()
     for t in t_targets:
-        s = int(max(1, round(1.0 / t / df)))
+        s = period_steps(t, df)
         distinct_spacings.add(s)
         for F in finesse_vals:
-            w = int(min(s, max(1, round(s / F))))
+            w = int(max(1, min(int(s), round(s / F))))
             requested.append((float(t), float(F), s, w))
             todo.setdefault((s, w), len(todo))
     uniq = list(todo)       # unique (s_steps, w_steps), in first-seen order
@@ -2128,20 +2367,24 @@ def run_scan(storage_min, storage_max, n_points,
     # prefilled from progress.csv when resuming - the only reuse mechanism,
     # and it is what shrinks items (below) to just the unburned cells.
     cache = {}               # (s_steps, w_steps) -> quality
+    fmeas = {}               # (s_steps, w_steps) -> measured finesse (nan if
+                             # unmeasurable, or from a pre-column checkpoint)
     ckpt = None
     if sim_dir is not None:
         burn_spec = _burn_spec(scan_params, burn, pump_passes, target_window)
         grid_spec = {"storage_min": storage_min, "storage_max": storage_max,
                     "n_points": int(n_points), "finesse_min": finesse_min,
                     "finesse_max": finesse_max, "n_finesse": int(n_finesse),
-                    "top_n": int(top_n), "df_user": float(df_user)}
+                    "top_n": int(top_n), "df_user": float(df_user),
+                    "min_storage_sep": min_storage_sep}
         grid = {"requested": requested, "uniq": uniq,
                 "finesse_vals": [float(v) for v in finesse_vals],
                 "t_targets": [float(v) for v in t_targets]}
         ckpt, done = _open_run_dir(sim_dir, tag, burn_spec, grid_spec, grid,
                                    scan_params, resume, log,
                                    checkpoint_every=checkpoint_every)
-        cache.update(done)
+        cache.update((k, q) for k, (q, _) in done.items())
+        fmeas.update((k, fa) for k, (_, fa) in done.items())
 
     # One result row per requested (storage time, finesse) cell, from the
     # cache - built once at the top so both an early "already complete" return
@@ -2161,7 +2404,9 @@ def run_scan(storage_min, storage_max, n_points,
             spacing_mhz, width_mhz = s * df, w * df
             q *= _target_match(t, F, spacing_mhz, width_mhz)
             results.append({"spacing_MHz": spacing_mhz, "width_MHz": width_mhz,
-                            "finesse": F, "storage_us": t, "quality": q})
+                            "finesse": F, "storage_us": t, "quality": q,
+                            "measured_finesse": fmeas.get((s, w),
+                                                          float("nan"))})
         return results, n_missing
 
     log(f"[{tag}]  {len(t_targets)} storage times x {len(finesse_vals)} "
@@ -2171,17 +2416,21 @@ def run_scan(storage_min, storage_max, n_points,
     if df != df_user:
         _refined_bytes, _ = _estimate_worker_bytes(scan_params,
                                                    min_finesse=finesse_min)
-        log(f"    refined df {df_user:g} -> {df:g} MHz so the {len(t_targets)} "
-            f"requested storage times resolve to {len(distinct_spacings)} "
-            f"distinct combs (finer mesh, slower burns) - "
-            f"~{_fmt_bytes(_refined_bytes)}/worker now")
-    if len(distinct_spacings) < len(t_targets):
-        log(f"    note: even at df {df:g} MHz only {len(distinct_spacings)} of "
-            f"{len(t_targets)} storage times land on distinct combs across "
-            f"{storage_min:g}-{storage_max:g} us - the rest differ by less than "
-            + ("what a worker can hold in memory"
-               if _capped_by_memory else "the mesh")
-            + " and repeat a burn")
+        log(f"    refined df {df_user:g} -> {df:g} MHz so neighbouring storage "
+            f"times differ by at least one mesh step of tooth spacing (finer "
+            f"mesh, slower burns) - ~{_fmt_bytes(_refined_bytes)}/worker now")
+    # Past t_jitter, neighbouring storage times' periods differ by less than
+    # one df step: still distinct combs on average (fractional periods), but
+    # with each tooth up to df/2 off its ideal position.
+    _dt = (storage_max - storage_min) / max(1, len(t_targets) - 1)
+    t_jitter = float(np.sqrt(_dt / df)) if _dt > 0 else np.inf
+    if t_jitter < storage_max:
+        log(f"    note: above ~{t_jitter:.3g} us neighbouring storage times "
+            f"differ by less than one df {df:g} MHz step of tooth spacing - "
+            f"each still burns its own exact mean period, but with teeth up to "
+            f"half a step off the ideal comb (df not refined further: "
+            + ("worker memory" if _capped_by_memory else "mesh limits")
+            + ")")
 
     # Built once: transition table, axes, initial rho, spectrum FFT setup.
     # Each worker process builds its own copy in _init_worker; this one is the
@@ -2194,13 +2443,12 @@ def run_scan(storage_min, storage_max, n_points,
         log(f"    resuming: {n_done0} of {len(uniq)} burns already done, "
             f"{len(items)} left")
 
-    # Every kept spectrum is recomputed after the sweep, so keeping more of
-    # them than there are burns is meaningless.
-    top_n = int(max(1, min(top_n, len(uniq))))
-    if top_n >= len(uniq):
-        log(f"    keeping every one of the {len(uniq)} spectra, so the collect "
-            f"pass re-burns the whole grid - about twice the sweep time. Lower "
-            f"'keep top N' to avoid that.")
+    # One spectrum is kept per storage time (see _best_per_storage), so
+    # keeping more than there are distinct storage times is meaningless.
+    top_n = int(max(1, min(top_n, len(distinct_spacings))))
+    if top_n >= len(distinct_spacings):
+        log(f"    keeping the best spectrum at every one of the "
+            f"{len(distinct_spacings)} storage times")
 
     # Pre-flight memory budget: fail fast with advice, rather than starting a
     # sweep that swaps or gets OOM-killed part way through. n_f comes from the
@@ -2210,7 +2458,7 @@ def run_scan(storage_min, storage_max, n_points,
     _per_worker, _breakdown = _estimate_worker_bytes(scan_params,
                                                      min_finesse=finesse_min)
     _avail, _avail_src = _available_bytes()
-    _parent_estimate = _per_worker + top_n * n_f * 8 + len(requested) * 250
+    _parent_estimate = _per_worker + top_n * n_f * 8 + len(requested) * 350
     _budget = 0.6 * _avail - _parent_estimate
     _nw = n_workers or max(1, (os.cpu_count() or 1) - 1)
     if parallel and items:
@@ -2240,6 +2488,11 @@ def run_scan(storage_min, storage_max, n_points,
             f"{top_n} spectra at n_f={n_f} would need more memory than is "
             f"available ({_fmt_bytes(_avail)})")
         top_n = _top_n_ceiling
+    storage_sep = _resolve_storage_sep(min_storage_sep, storage_min,
+                                       storage_max, top_n)
+    if storage_sep:
+        log(f"    keeping storage times at least {storage_sep:.3g} us apart"
+            + (" (auto)" if min_storage_sep in (None, "auto") else ""))
 
     # A single spectrum, timed, to estimate the whole run - the sweep plus the
     # collect pass that fetches the winners' spectra afterwards. Probed from
@@ -2252,11 +2505,12 @@ def run_scan(storage_min, storage_max, n_points,
         _, _probe_rec = compute_one(_probe_item, ctx=ctx, want_spec=False)
         _one = time.time() - _t0
         items = [it for it in items if it[0] != _probe_item[0]]
-        _pq, _pn, _psmhz, _pwmhz = _probe_rec
+        _pq, _pn, _psmhz, _pwmhz, _pfa = _probe_rec
         cache[uniq[_pn]] = _pq
+        fmeas[uniq[_pn]] = _pfa
         if ckpt is not None:
             _ps, _pw = uniq[_pn]
-            ckpt.append(_pn, _ps, _pw, _psmhz, _pwmhz, _pq, _one)
+            ckpt.append(_pn, _ps, _pw, _psmhz, _pwmhz, _pq, _one, _pfa)
     else:
         _one = 0.0
     _n_jobs = len(items) + top_n
@@ -2268,17 +2522,18 @@ def run_scan(storage_min, storage_max, n_points,
     if estimate is not None:
         estimate(_total)
 
-    best = []                # heap of (quality, n) - keys only, no arrays
+    # The best (quality, n) seen so far at each storage time (s_steps) - keys
+    # only, no arrays, and at most one entry per distinct spacing. The top_n
+    # cut happens in _collect, via _best_per_storage.
+    best = {}
     _key_of = {key: n for n, key in enumerate(uniq)}
 
     def _keep(key):
-        import heapq
-        if len(best) < top_n:
-            heapq.heappush(best, key)
-        elif key > best[0]:
-            heapq.heappushpop(best, key)
+        s = uniq[key[1]][0]
+        if s not in best or key > best[s]:
+            best[s] = key
 
-    # Seed the winners' heap from whatever is already in the cache - the
+    # Seed the winners from whatever is already in the cache - the
     # resumed burns, and the probe above - so a resume's top spectra are
     # chosen from the whole grid, not just what this call re-burns. A resumed
     # cache can hold keys the *current* grid no longer requests at all (an
@@ -2317,9 +2572,10 @@ def run_scan(storage_min, storage_max, n_points,
     _prev_done_t = [_sweep_t0]      # for progress.csv's "seconds" column
 
     def _consume(i, record):
-        quality, n, s_mhz, w_mhz = record
+        quality, n, s_mhz, w_mhz, f_meas = record
         s_steps, w_steps = uniq[n]
         cache[(s_steps, w_steps)] = quality
+        fmeas[(s_steps, w_steps)] = f_meas
         _keep((quality, n))
         now = time.time()
         if ckpt is not None:
@@ -2328,7 +2584,7 @@ def run_scan(storage_min, storage_max, n_points,
             # gives no per-task timer). A diagnostic column only; nothing reads
             # it back.
             ckpt.append(n, s_steps, w_steps, s_mhz, w_mhz, quality,
-                       now - _prev_done_t[0])
+                        now - _prev_done_t[0], f_meas)
             _prev_done_t[0] = now
         _tick(i)
         if (i == 1 or i == len(items) or i % _log_step == 0
@@ -2340,7 +2596,8 @@ def run_scan(storage_min, storage_max, n_points,
             fin = s_mhz / w_mhz if w_mhz else float("nan")
             log(f"  scan {i}/{len(items)} ({100.0 * i / len(items):.0f}%) - "
                 f"{_fmt_dur(el)} elapsed, ~{_fmt_dur(eta)} left - "
-                f"last t_s {t_s:.3g}us F {fin:.1f} Q {quality:.2f}")
+                f"last t_s {t_s:.3g}us F {fin:.1f} (measured {f_meas:.1f}) "
+                f"Q {quality:.2f}")
             if ckpt is not None:
                 ckpt.write_status(state="running")
 
@@ -2352,11 +2609,15 @@ def run_scan(storage_min, storage_max, n_points,
         made: one contiguous (top_n, n_f) block, and one frequency axis shared
         by every record rather than a separate unpickled copy each.
         """
-        keys = sorted(best, reverse=True)
+        keys = _best_per_storage(best.values(), uniq, top_n, df, storage_sep)
+        if storage_sep and len(keys) < top_n:
+            log(f"    only {len(keys)} storage times are {storage_sep:.3g} us "
+                f"apart - keeping {len(keys)} of the {top_n} asked for")
         f_axis = ctx["f"]
         specs = np.empty((len(keys), len(f_axis)))
         jobs = [(row, uniq[n]) for row, (_, n) in enumerate(keys)]
-        log(f"[{tag}]  collecting the top {len(jobs)} spectra")
+        log(f"[{tag}]  collecting the best spectrum at the top {len(jobs)} "
+            f"storage times")
         _t = time.time()
         stream = (pool.imap_unordered(_spectrum_for, jobs, chunksize=1)
                   if pool is not None
@@ -2370,9 +2631,16 @@ def run_scan(storage_min, storage_max, n_points,
         for row, (quality, n) in enumerate(keys):
             s_steps, w_steps = uniq[n]
             s_mhz, w_mhz = s_steps * df, w_steps * df
+            f_meas = fmeas.get(uniq[n], float("nan"))
+            if not np.isfinite(f_meas):
+                # resumed from a checkpoint older than the column: the
+                # spectrum is right here, so measure it rather than leave a gap
+                f_meas = _score_quality_and_finesse(
+                    f_axis, specs[row], target_window, s_mhz, w_mhz)[1]
             rows.append({"quality": quality, "n": n, "spec": specs[row],
                          "f": f_axis, "spacing_MHz": s_mhz,
                          "width_MHz": w_mhz, "finesse": s_mhz / w_mhz,
+                         "measured_finesse": f_meas,
                          "storage_us": 1.0 / s_mhz})
         return rows
 
@@ -2586,6 +2854,7 @@ def scan_teams_notifier(webhook_url=None, log=None):
 #                      view, and (pid + heartbeat) the run's lock
 #   runlog.txt        every line the caller's `log` callback emits, timestamped
 #   results.csv, best.json, top_spectra.npy, figures/*.png   final outputs
+#   figures/top_spectra/*.png                                 one per kept spectrum
 #
 # progress.csv is authoritative; status.json is advisory and never consulted
 # by a resume - a folder with no status.json at all (the writer died before
@@ -2677,14 +2946,41 @@ def _atomic_write_json(path, obj):
         raise
 
 
-_PROGRESS_HEADER = ("n", "s_steps", "w_steps", "spacing_MHz", "width_MHz",
-                    "quality", "seconds")
+# measured_finesse was added after the first simulation folders were written,
+# so it goes last: every older column keeps its index, and a folder started
+# under _PROGRESS_HEADER_V1 resumes by appending the longer rows beneath its
+# old header (see _read_progress_rows for how the two are told apart).
+_PROGRESS_HEADER_V1 = ("n", "s_steps", "w_steps", "spacing_MHz", "width_MHz",
+                       "quality", "seconds")
+_PROGRESS_HEADER = _PROGRESS_HEADER_V1 + ("measured_finesse",)
+
+
+def _parse_steps(text):
+    """
+    A tooth period as written to ``progress.csv``: an ``int`` for a whole
+    number of df steps, else the exact ``float`` (``repr`` round-trips) - see
+    :func:`period_steps`. ``int`` and ``float`` keys of equal value hash alike,
+    so lookups against ``grid.json``'s ``uniq`` work either way.
+    """
+    try:
+        return int(text)
+    except ValueError:
+        return float(text)
 
 
 def _read_progress(path):
     """
     Completed burns from an append-only ``progress.csv``, as
-    ``{(s_steps, w_steps): quality}``.
+    ``{(s_steps, w_steps): quality}`` - :func:`_read_progress_rows` without
+    the measured finesse.
+    """
+    return {k: q for k, (q, _) in _read_progress_rows(path).items()}
+
+
+def _read_progress_rows(path):
+    """
+    Completed burns from an append-only ``progress.csv``, as
+    ``{(s_steps, w_steps): (quality, measured_finesse)}``.
 
     A crash between a write and its flush can leave the last line partial, or
     - when the file was extended but the write never reached disk - a run of
@@ -2693,6 +2989,12 @@ def _read_progress(path):
     field count, or an unparseable number is skipped. On a duplicate key the
     last row wins, so a point re-run after a resume overwrites its own earlier,
     possibly-truncated line.
+
+    A folder started before the ``measured_finesse`` column existed has the
+    old 7-column header; its rows read with ``measured_finesse = nan``, and a
+    resume appends full-width rows beneath them, so such a file holds both
+    widths and both are accepted. A file with the current header only ever
+    holds full-width rows, so a short row there is damage, not history.
     """
     done = {}
     if not os.path.exists(path):
@@ -2708,20 +3010,49 @@ def _read_progress(path):
         lines.pop()                              # torn final line
     if len(lines) < 2:                           # header only, or nothing
         return done
+    widths = {len(_PROGRESS_HEADER)}
+    if tuple(lines[0].strip().split(",")) == _PROGRESS_HEADER_V1:
+        widths.add(len(_PROGRESS_HEADER_V1))
     for line in lines[1:]:
         if "\x00" in line:
             continue
         parts = line.split(",")
-        if len(parts) != len(_PROGRESS_HEADER):
+        if len(parts) not in widths:
             continue
         try:
-            s_steps = int(parts[1])
+            s_steps = _parse_steps(parts[1])
             w_steps = int(parts[2])
             quality = float(parts[5])
+            f_meas = (float(parts[7]) if len(parts) > 7 else float("nan"))
         except ValueError:
             continue
-        done[(s_steps, w_steps)] = quality
+        done[(s_steps, w_steps)] = (quality, f_meas)
     return done
+
+
+def _trim_torn_tail(path):
+    """
+    Cut a torn final line (one with no closing newline - see
+    :func:`_read_progress_rows`) off ``progress.csv`` before appending to it.
+
+    Readers already ignore those bytes, so this changes nothing they see; it
+    only stops the first appended row from being glued onto the torn one.
+    That matters more now that a pre-``measured_finesse`` file accepts two row
+    widths: a torn ``"5,1"`` glued to a full row reads as a plausible
+    full-width row with the wrong ``s_steps``. Everything before the last
+    newline is left untouched - this is not a rewrite.
+    """
+    if not os.path.exists(path):
+        return
+    with open(path, "rb+") as fh:
+        data = fh.read()
+        if not data or data.endswith(b"\n"):
+            return
+        cut = data.rfind(b"\n") + 1
+        fh.seek(cut)
+        fh.truncate()
+        if cut == 0:                    # even the header was torn
+            fh.write((",".join(_PROGRESS_HEADER) + "\n").encode())
 
 
 def _is_live(status):
@@ -2766,6 +3097,7 @@ class _Checkpoint:
         self.resumed_from = resumed_from
         self.n_total = n_total
         self._checkpoint_every = max(1, int(checkpoint_every))
+        _trim_torn_tail(os.path.join(sim_dir, "progress.csv"))
         self._fh = open(os.path.join(sim_dir, "progress.csv"), "a")
         self._since_sync = 0
         self._last_sync = time.time()
@@ -2774,9 +3106,10 @@ class _Checkpoint:
         self._best_quality = None
         self._last_point = None
 
-    def append(self, n, s_steps, w_steps, s_mhz, w_mhz, quality, seconds):
+    def append(self, n, s_steps, w_steps, s_mhz, w_mhz, quality, seconds,
+               measured_finesse=float("nan")):
         self._fh.write(f"{n},{s_steps},{w_steps},{s_mhz!r},{w_mhz!r},"
-                       f"{quality!r},{seconds:.3f}\n")
+                       f"{quality!r},{seconds:.3f},{float(measured_finesse)!r}\n")
         self._since_sync += 1
         self._n_done += 1
         if self._best_quality is None or quality > self._best_quality:
@@ -2784,6 +3117,8 @@ class _Checkpoint:
         self._last_point = {
             "storage_us": 1.0 / s_mhz if s_mhz else None,
             "finesse": s_mhz / w_mhz if w_mhz else None,
+            "measured_finesse": (float(measured_finesse)
+                                 if np.isfinite(measured_finesse) else None),
             "quality": quality}
         now = time.time()
         # Both a count and a time bound: at a fine mesh a burn takes seconds,
@@ -2824,8 +3159,9 @@ def _open_run_dir(sim_dir, tag, burn_spec, grid_spec, grid, params, resume,
     """
     Open (or create) a simulation folder for :func:`run_scan`.
 
-    Returns a :class:`_Checkpoint` with ``done`` (a dict already merged into
-    the caller's ``cache``) prefilled from ``progress.csv`` when resuming.
+    Returns a :class:`_Checkpoint` and ``done``, the completed burns read from
+    ``progress.csv`` when resuming (``{key: (quality, measured_finesse)}``, as
+    :func:`_read_progress_rows` gives them; empty for a new folder).
     Refuses - raising ``ValueError`` - a folder that is live, that mismatches
     on ``burn_spec``, or (when ``resume`` is false) that already has a run:
     there is no forced resume, because a forced one would silently mix two
@@ -2881,7 +3217,7 @@ def _open_run_dir(sim_dir, tag, burn_spec, grid_spec, grid, params, resume,
             _atomic_write_json(manifest_path, manifest)
             _atomic_write_json(grid_path, grid)
 
-        done = _read_progress(os.path.join(sim_dir, "progress.csv"))
+        done = _read_progress_rows(os.path.join(sim_dir, "progress.csv"))
         return (_Checkpoint(sim_dir, resumed_from=len(done),
                             n_total=len(grid["uniq"]),
                             checkpoint_every=checkpoint_every), done)
@@ -2967,7 +3303,9 @@ def load_run(sim_dir):
     reached ``progress.csv``. ``results`` is rebuilt from ``grid.json``'s
     requested grid and the completed keys, omitting any cell not yet burned -
     the same convention :func:`run_scan` itself uses, so the scan plots need
-    no special-casing for a partial run. ``best`` comes from ``best.json`` and
+    no special-casing for a partial run. A folder checkpointed before
+    ``progress.csv`` had a ``measured_finesse`` column reads that field as
+    ``nan`` for every cell. ``best`` comes from ``best.json`` and
     ``top_spectra.npy`` when a collect pass has run (see :func:`collect_top`),
     and is empty otherwise.
     """
@@ -2975,7 +3313,7 @@ def load_run(sim_dir):
         manifest = json.load(fh)
     with open(os.path.join(sim_dir, "grid.json")) as fh:
         grid = json.load(fh)
-    done = _read_progress(os.path.join(sim_dir, "progress.csv"))
+    done = _read_progress_rows(os.path.join(sim_dir, "progress.csv"))
 
     params = params_from_json(json.dumps(manifest["params"]))
     df = float(manifest["burn_spec"]["df_used"])
@@ -2983,14 +3321,16 @@ def load_run(sim_dir):
     results = []
     n_missing = 0
     for t, F, s, w in grid["requested"]:
-        q = done.get((int(s), int(w)))
-        if q is None:
+        row = done.get((s, int(w)))
+        if row is None:
             n_missing += 1
             continue
+        q, f_meas = row
         spacing_mhz, width_mhz = s * df, w * df
         q *= _target_match(t, F, spacing_mhz, width_mhz)
         results.append({"spacing_MHz": spacing_mhz, "width_MHz": width_mhz,
-                        "finesse": F, "storage_us": t, "quality": q})
+                        "finesse": F, "storage_us": t, "quality": q,
+                        "measured_finesse": f_meas})
 
     best = []
     best_path = os.path.join(sim_dir, "best.json")
@@ -3013,7 +3353,7 @@ def load_run(sim_dir):
     # grid changed can have progress.csv rows the current grid no longer
     # requests at all (see the equivalent note in run_scan's own seeding
     # loop), and those should not inflate n_done past n_total.
-    n_done = sum(1 for s, w in grid["uniq"] if (int(s), int(w)) in done)
+    n_done = sum(1 for s, w in grid["uniq"] if (s, int(w)) in done)
     return {"tag": manifest["tag"], "results": results, "best": best,
            "params": params, "df_used": df,
            "finesse_vals": grid["finesse_vals"],
@@ -3048,28 +3388,41 @@ def _write_best(sim_dir, best):
     del mm
 
 
-def collect_top(sim_dir, top_n=None):
+def collect_top(sim_dir, top_n=None, min_storage_sep=None):
     """
-    (Re-)burn the best ``top_n`` spectra for a simulation folder from its
-    checkpointed scores, and write ``best.json`` + ``top_spectra.npy`` -
-    without re-running the sweep.
+    (Re-)burn the best spectrum at each of the ``top_n`` best storage times
+    for a simulation folder from its checkpointed scores (the same rule as
+    :func:`run_scan`, via :func:`_best_per_storage`), and write ``best.json`` +
+    ``top_spectra.npy`` - without re-running the sweep.
 
     Works whether the sweep finished, was cancelled, or crashed: it only needs
-    ``progress.csv``'s scores. ``top_n`` defaults to the value recorded in the
-    folder's manifest. Returns the ``best`` list, in the same shape
-    :func:`run_scan`'s own ``best`` carries.
+    ``progress.csv``'s scores. ``top_n`` and ``min_storage_sep`` (``"auto"``
+    or a gap in us, as in :func:`run_scan`) default to the values recorded in
+    the folder's manifest - ``"auto"`` for a folder from before the setting
+    existed. Returns the ``best`` list, in the same shape :func:`run_scan`'s
+    own ``best`` carries. Each kept comb's ``measured_finesse`` comes from
+    ``progress.csv``, or - for a folder checkpointed before that column
+    existed - is read off the re-burned spectrum itself.
     """
     with open(os.path.join(sim_dir, "manifest.json")) as fh:
         manifest = json.load(fh)
     with open(os.path.join(sim_dir, "grid.json")) as fh:
         grid = json.load(fh)
-    done = _read_progress(os.path.join(sim_dir, "progress.csv"))
-    if not done:
+    rows = _read_progress_rows(os.path.join(sim_dir, "progress.csv"))
+    if not rows:
         raise ValueError(f"{sim_dir} has no completed burns to collect from")
+    done = {k: q for k, (q, _) in rows.items()}
 
     uniq = [tuple(k) for k in grid["uniq"]]
-    top_n = int(manifest["grid_spec"]["top_n"] if top_n is None else top_n)
-    top_n = max(1, min(top_n, len(done)))
+    grid_spec = manifest["grid_spec"]
+    top_n = int(grid_spec["top_n"] if top_n is None else top_n)
+    # Clamped as run_scan clamps it, so an "auto" gap comes out the same.
+    top_n = max(1, min(top_n, len({s for s, _ in uniq})))
+    if min_storage_sep is None:
+        min_storage_sep = grid_spec.get("min_storage_sep", "auto")
+    storage_sep = _resolve_storage_sep(min_storage_sep,
+                                       grid_spec["storage_min"],
+                                       grid_spec["storage_max"], top_n)
 
     params = params_from_json(json.dumps(manifest["params"]))
     burn = (burn_series if manifest["burn_spec"]["burn"] == "burn_series"
@@ -3079,37 +3432,55 @@ def collect_top(sim_dir, top_n=None):
     ctx = _scan_context(params, burn, pump_passes, target_window)
     df = float(manifest["burn_spec"]["df_used"])
 
+    # Keys the current grid no longer requests (a checkpoint from before
+    # n_points/finesse changed) are not candidates - as in run_scan's seeding.
     key_of = {key: n for n, key in enumerate(uniq)}
-    ranked = sorted(((q, key_of[k]) for k, q in done.items()),
-                    reverse=True)[:top_n]
+    ranked = _best_per_storage(
+        ((q, key_of[k]) for k, q in done.items() if k in key_of), uniq, top_n,
+        df, storage_sep)
 
     best = []
     for quality, n in ranked:
         s_steps, w_steps = uniq[n]
         _, spec = _spectrum_at((0, (s_steps, w_steps)), ctx)
         s_mhz, w_mhz = s_steps * df, w_steps * df
+        f_meas = rows[(s_steps, w_steps)][1]
+        if not np.isfinite(f_meas):
+            f_meas = _score_quality_and_finesse(ctx["f"], spec, target_window,
+                                                s_mhz, w_mhz)[1]
         best.append({"quality": quality, "n": n, "spec": spec, "f": ctx["f"],
                      "spacing_MHz": s_mhz, "width_MHz": w_mhz,
-                     "finesse": s_mhz / w_mhz, "storage_us": 1.0 / s_mhz})
+                     "finesse": s_mhz / w_mhz, "measured_finesse": f_meas,
+                     "storage_us": 1.0 / s_mhz})
 
     _write_best(sim_dir, best)
     return best
 
 
+#: The columns of a scan's ``results.csv`` (and the GUI's ``*_results.csv``
+#: export), one per key of a :func:`run_scan` ``results`` row. ``finesse`` is
+#: the written (requested) finesse; ``measured_finesse`` the one the burned
+#: comb came out with - empty for a scan saved before that was recorded.
+RESULTS_COLUMNS = ("spacing_MHz", "width_MHz", "finesse", "storage_us",
+                   "quality", "measured_finesse")
+
+
 def write_run_outputs(sim_dir, scan):
     """
     Write a completed (or partial) scan's final outputs into its simulation
-    folder: ``results.csv``, ``best.json`` + ``top_spectra.npy`` (see
-    :func:`_write_best`), and the three scan figures under ``figures/``.
+    folder: ``results.csv`` (:data:`RESULTS_COLUMNS`), ``best.json`` +
+    ``top_spectra.npy`` (see :func:`_write_best`), the scan figures
+    (:data:`SCAN_FIGURES`) under ``figures/``, and one
+    image per kept spectrum under ``figures/top_spectra/``
+    (:func:`save_top_spectrum_figures`).
 
     Called by :func:`run_scan` itself once a sweep with a ``sim_dir``
     completes, and usable standalone to re-export a folder (a different
     ``top_n`` via :func:`collect_top` first, say) without recomputing anything.
     """
     os.makedirs(sim_dir, exist_ok=True)
-    cols = ["spacing_MHz", "width_MHz", "finesse", "storage_us", "quality"]
     with open(os.path.join(sim_dir, "results.csv"), "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=cols)
+        w = csv.DictWriter(fh, fieldnames=RESULTS_COLUMNS)
         w.writeheader()
         w.writerows(scan["results"])
 
@@ -3119,9 +3490,7 @@ def write_run_outputs(sim_dir, scan):
     os.makedirs(fig_dir, exist_ok=True)
     from matplotlib.figure import Figure
     fig = Figure(figsize=(8, 4), constrained_layout=True)
-    for name, fn in (("heatmap", plot_scan_heatmap),
-                     ("quality_vs_storage", plot_scan_max),
-                     ("topspectra", plot_top_spectra)):
+    for name, fn in SCAN_FIGURES:
         fig.clear()
         try:
             # A very partial run (a handful of cells, or none kept yet) can
@@ -3132,6 +3501,161 @@ def write_run_outputs(sim_dir, scan):
         except Exception:                              # noqa: BLE001
             pass
     del fig
+    # One image per kept spectrum too - the overlay above gets unreadable past
+    # a handful of them.
+    try:
+        save_top_spectrum_figures(scan, os.path.join(fig_dir, "top_spectra"))
+    except Exception:                                  # noqa: BLE001
+        pass
+
+
+#: Everything of a burn result :func:`save_burn` keeps. ``rho``/``rho0`` (and
+#: ``det``/``trans``) are left out on purpose: the populations are
+#: ``n_g x n_det`` - far larger than the spectrum at a fine mesh - and nothing
+#: that redraws a finished burn reads them.
+_BURN_KEYS = ("f", "spec", "pump_freqs", "stages")
+
+
+def save_burn(path, out, params, session=None):
+    """
+    Write a single-hole / comb / preparation-sequence result to ``path`` (a
+    pickle) so :func:`load_result` can reopen it later.
+
+    ``out`` is what :func:`run_burn` or :func:`run_sequence` returned;
+    ``params`` the parameters it ran with, kept so a reopened burn plots on
+    its own crystal and window rather than whatever is configured now.
+    ``session`` is any extra caller state to carry along - the GUI stores its
+    side-panel settings there so reopening also restores the mode, fields and
+    sequence rows. ``f`` and ``spec`` are stored as-is, so a reloaded
+    spectrum is bit-identical to the one that was saved.
+    """
+    rec = {k: out[k] for k in _BURN_KEYS if out.get(k) is not None}
+    rec.update({"kind": "burn", "params": params, "session": session})
+    with open(path, "wb") as fh:
+        pickle.dump(rec, fh)
+
+
+def upgrade_legacy_scan(scan):
+    """
+    Convert a scan pickled by the old notebooks' ``run_scan`` (the
+    ``results_YYYYMMDD_HHMMSS.pkl`` files) into the dict :func:`run_scan`
+    returns today, so the same plots and GUI views read it.
+
+    The notebook scan swept tooth spacing x burn width and scored each point
+    by its delta OD over the central ``target_window``, storing
+
+        results   (spacing_MHz, width_MHz, delta_od) tuples
+        best      (delta_od, n, spec, spacing_MHz, width_steps, f) tuples
+
+    Those map onto today's axes directly - storage time is ``1 / spacing``
+    and finesse ``spacing / width`` - but the score is a different quantity,
+    so it is carried over as ``quality`` with ``metric = "delta_od"`` and the
+    plots label it as such rather than as AFC comb quality.
+    """
+    params = scan["params"]
+    df = settings(params)["df"]
+
+    def cell(spacing, width):
+        return {"spacing_MHz": float(spacing), "width_MHz": float(width),
+                "finesse": float(spacing) / float(width),
+                "storage_us": 1.0 / float(spacing)}
+
+    results = [{**cell(s, w), "quality": float(d),
+                "measured_finesse": float("nan")}
+               for s, w, d in scan["results"]]
+
+    # One shared frequency axis, as run_scan keeps it: every record of one
+    # scan was burned on the same mesh, and the notebook pickled one copy per
+    # record only because it held the arrays by value.
+    best, f_axis = [], None
+    for d, _, spec, spacing, width_steps, f in scan.get("best", []):
+        if f_axis is None:
+            f_axis = np.asarray(f)
+        best.append({**cell(spacing, width_steps * df), "quality": float(d),
+                     "f": f_axis, "spec": np.asarray(spec)})
+
+    finesse_vals = sorted({round(r["finesse"], 9) for r in results})
+    return {"tag": scan.get("tag", "legacy"), "results": results,
+           "best": best, "params": params, "df_used": df,
+           "finesse_vals": finesse_vals,
+           "target_window": scan.get("target_window"),
+           "pump_passes": scan.get("pump_passes"),
+           "metric": "delta_od", "sim_dir": None, "state": "complete",
+           "n_done": len(results), "n_total": len(results), "n_missing": 0}
+
+
+def _sibling_config(npy_path):
+    """
+    The ``<prefix>_config.json`` an export wrote beside ``<prefix>_spectrum.npy``
+    - its ``params`` (and GUI session), or ``(None, None)`` if there is none.
+    """
+    base = os.path.splitext(npy_path)[0]
+    if base.endswith("_spectrum"):
+        base = base[:-len("_spectrum")]
+    cfg = base + "_config.json"
+    if not os.path.exists(cfg):
+        return None, None
+    with open(cfg) as fh:
+        data = json.load(fh)
+    params = data["params"] if "params" in data else data
+    params = params_from_json(json.dumps(params, default=_json_default))
+    return params, (data if "gui" in data else None)
+
+
+def load_result(path):
+    """
+    Open any saved simulation result. Returns ``(kind, data)``, with ``kind``
+    either ``"scan"`` (``data`` shaped like :func:`run_scan`'s return) or
+    ``"burn"`` (shaped like :func:`run_burn`'s, minus the populations, plus
+    ``params`` and ``session`` - either may be None).
+
+    Accepts
+
+    - a simulation folder - read with :func:`load_run`;
+    - a scan pickle, either a GUI export (``*_scan.pkl``) or an old
+      notebook's ``results_*.pkl`` (converted by :func:`upgrade_legacy_scan`);
+    - a burn pickle written by :func:`save_burn` (``*_burn.pkl``);
+    - a ``(2, n)`` ``.npy`` of frequency and absorption - an older GUI
+      ``*_spectrum.npy`` export or a notebook ``{tag}.npy``. These carry no
+      pump pattern, so ``pump_freqs`` is empty; ``params`` comes from a
+      sibling ``*_config.json`` when one exists.
+    """
+    path = os.fspath(path)
+    if os.path.isdir(path):
+        if not os.path.exists(os.path.join(path, "manifest.json")):
+            raise ValueError("not a simulation folder (no manifest.json "
+                             "in it)")
+        return "scan", load_run(path)
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".npy":
+        arr = np.load(path, allow_pickle=False)
+        if arr.ndim != 2 or arr.shape[0] != 2:
+            raise ValueError(f"expected a (2, n) frequency/absorption array, "
+                             f"got shape {arr.shape}")
+        params, session = _sibling_config(path)
+        return "burn", {"f": arr[0], "spec": arr[1],
+                        "pump_freqs": np.array([], dtype=float),
+                        "params": params, "session": session}
+
+    with open(path, "rb") as fh:
+        data = pickle.load(fh)
+    if not isinstance(data, dict):
+        raise ValueError("not a saved simulation result")
+    if data.get("kind") == "burn":
+        return "burn", data
+    if "results" in data and "params" in data:
+        res = data["results"]
+        if len(res) and not isinstance(res[0], dict):
+            return "scan", upgrade_legacy_scan(data)
+        if "best" in data:
+            # sim_dir is whatever was live when this was exported - drop it
+            # if that folder is gone, so nothing points at a missing path.
+            if data.get("sim_dir") and not os.path.isdir(data["sim_dir"]):
+                data["sim_dir"] = None
+            return "scan", data
+    raise ValueError("not a saved simulation result - expected a scan "
+                     "('results'/'best') or a burn pickle")
 
 
 # ===========================================================================
@@ -3265,13 +3789,26 @@ def plot_populations(ax, out, *, title="Ion classes addressed by the burn",
     return ax
 
 
-def _scan_grids(scan):
+def _metric_label(scan, *, tex=True):
+    """
+    What a scan's ``quality`` column measures, for axis labels and titles.
+    AFC comb quality for any scan :func:`run_scan` produced; the delta OD an
+    old notebook scored by for one :func:`upgrade_legacy_scan` converted.
+    """
+    if scan.get("metric") == "delta_od":
+        return r"$\Delta$Absorption" if tex else "ΔAbsorption"
+    return "AFC comb quality"
+
+
+def _scan_grids(scan, value="quality"):
     """
     (storage_vals, finesse_vals, z) from a scan's ``results``.
 
     storage_vals   1 / tooth_spacing, in us, ascending
-    finesse_vals   tooth_spacing / tooth_width, ascending
-    z              z[finesse_row, storage_col] = AFC comb quality (NaN where unset)
+    finesse_vals   tooth_spacing / tooth_width (the written finesse), ascending
+    z              z[finesse_row, storage_col] = that cell's ``value`` - AFC
+                   comb quality by default, or e.g. ``"measured_finesse"``
+                   (NaN where unset, or where a row does not carry ``value``)
     """
     res = scan["results"]
     storage_vals = np.array(sorted({r["storage_us"] for r in res}))
@@ -3280,8 +3817,28 @@ def _scan_grids(scan):
     for r in res:
         col = int(np.searchsorted(storage_vals, r["storage_us"]))
         row = int(np.searchsorted(finesse_vals, round(r["finesse"], 9)))
-        z[row, col] = r["quality"]
+        z[row, col] = r.get(value, np.nan)
     return storage_vals, finesse_vals, z
+
+
+def _measured_note(r):
+    """`` (measured 2.1)`` for a result/best row with a finite measured
+    finesse, else ``""`` - for labels that quote the written finesse."""
+    fa = r.get("measured_finesse")
+    if fa is None or not np.isfinite(fa):
+        return ""
+    return f" (measured {fa:.1f})"
+
+
+def _require_measured_finesse(scan):
+    """The ``results`` rows that carry a finite measured finesse; raises
+    ``ValueError`` (shown in place of the plot) when there are none."""
+    rows = [r for r in scan["results"]
+            if np.isfinite(r.get("measured_finesse", np.nan))]
+    if not rows:
+        raise ValueError("No measured finesse recorded for this scan -\n"
+                         "it was saved before shb.py recorded one.")
+    return rows
 
 
 def plot_scan_heatmap(ax, scan, *, save=None):
@@ -3289,10 +3846,63 @@ def plot_scan_heatmap(ax, scan, *, save=None):
     storage_vals, finesse_vals, z = _scan_grids(scan)
     mesh = ax.pcolormesh(storage_vals, finesse_vals, z, shading="nearest",
                          vmin=0.0)
-    ax.figure.colorbar(mesh, ax=ax, label="AFC comb quality")
-    ax.set_title(f"AFC comb quality over the central {scan['target_window']:g} MHz")
+    label = _metric_label(scan)
+    ax.figure.colorbar(mesh, ax=ax, label=label)
+    ax.set_title(f"{label} over the central {scan['target_window']:g} MHz")
     ax.set_xlabel(r"Storage time ($\mu$s)")
     ax.set_ylabel(r"Finesse  $F = \Delta / \gamma$")
+    if save:
+        ax.figure.savefig(save)
+    return ax
+
+
+def plot_scan_measured_finesse(ax, scan, *, save=None):
+    """
+    The finesse each burned comb actually came out with
+    (:func:`_measured_finesse`), on the same storage time x *written* finesse
+    grid as :func:`plot_scan_heatmap`, so the two read side by side.
+
+    A comb written at ``F = 10`` routinely measures nearer ``F = 2`` once
+    power broadening and side-hole refilling spread the teeth; a column that
+    stays one colour all the way up the finesse axis is one where the written
+    finesse made no real difference to the comb.
+    """
+    _require_measured_finesse(scan)
+    storage_vals, finesse_vals, z = _scan_grids(scan, "measured_finesse")
+    mesh = ax.pcolormesh(storage_vals, finesse_vals, z, shading="nearest",
+                         vmin=0.0)
+    ax.figure.colorbar(mesh, ax=ax, label=r"Measured finesse $F_a$")
+    ax.set_title(f"Measured comb finesse over the central "
+                 f"{scan['target_window']:g} MHz")
+    ax.set_xlabel(r"Storage time ($\mu$s)")
+    ax.set_ylabel(r"Written finesse  $F_w = \Delta / \gamma$")
+    if save:
+        ax.figure.savefig(save)
+    return ax
+
+
+def plot_finesse_written_vs_measured(ax, scan, *, save=None):
+    """
+    Measured finesse against written finesse, one point per scan cell,
+    coloured by its comb quality, with the ``F_a = F_w`` line a comb that kept
+    its written finesse would sit on. How far the cloud falls below that line
+    is how much of the scan's finesse axis the burned combs never reached.
+    """
+    rows = _require_measured_finesse(scan)
+    f_w = np.array([r["finesse"] for r in rows])
+    f_a = np.array([r["measured_finesse"] for r in rows])
+    q = np.array([r["quality"] for r in rows])
+    pts = ax.scatter(f_w, f_a, c=q, s=14, vmin=0.0)
+    hi = float(max(f_w.max(), f_a.max()))
+    ax.plot([0.0, hi], [0.0, hi], color="0.5", lw=0.8, ls="--",
+            label="as written")
+    ax.figure.colorbar(pts, ax=ax, label=_metric_label(scan))
+    ax.set_title("Measured vs written comb finesse")
+    ax.set_xlabel(r"Written finesse  $F_w = \Delta / \gamma$")
+    ax.set_ylabel(r"Measured finesse  $F_a$")
+    ax.set_xlim(left=0.0)
+    ax.set_ylim(bottom=0.0)
+    ax.legend(fontsize=9, loc="upper left")
     if save:
         ax.figure.savefig(save)
     return ax
@@ -3322,13 +3932,18 @@ def plot_scan_max(ax, scan, *, save=None):
     ax.plot(storage_vals, q_max, color="C0", lw=1.0, ls="--", label="best")
     ax.plot(storage_vals, q_min, color="C0", lw=1.0, ls=":", label="worst")
     i = int(np.argmax(q_max))
+    best_row = max((r for r in scan["results"]
+                    if r["storage_us"] == storage_vals[i]),
+                   key=lambda r: r["quality"])
     ax.plot(storage_vals[i], q_max[i], linestyle="none", marker="o",
             markersize=11, markerfacecolor="none", markeredgecolor="C1",
             markeredgewidth=1.8,
-            label=f"best: {storage_vals[i]:.3g} $\\mu$s, F {best_fin[i]:.1f}")
-    ax.set_title("AFC comb quality vs storage time (best / mean / worst)")
+            label=f"best: {storage_vals[i]:.3g} $\\mu$s, F {best_fin[i]:.1f}"
+                  + _measured_note(best_row))
+    label = _metric_label(scan)
+    ax.set_title(f"{label} vs storage time (best / mean / worst)")
     ax.set_xlabel(r"Storage time ($\mu$s)")
-    ax.set_ylabel("AFC comb quality")
+    ax.set_ylabel(label)
     ax.set_ylim(bottom=0.0)
     ax.legend(fontsize=9, loc="lower right")
     if save:
@@ -3350,19 +3965,86 @@ def plot_top_spectra(ax, scan, *, save=None, legend=True):
     lines, labels = [], []
     for r in scan["best"]:
         lab = (f"quality {r['quality']:.3f} | "
-               f"t_s {r['storage_us']:.3g} $\\mu$s, F {r['finesse']:.1f}")
+               f"t_s {r['storage_us']:.3g} $\\mu$s, F {r['finesse']:.1f}"
+               + _measured_note(r))
         (ln,) = ax.plot(r["f"], r["spec"], lw=0.7, label=lab)
         lines.append(ln)
         labels.append(lab)
     ax.set_xlabel("Frequency (MHz)")
     ax.set_ylabel("Absorption (Normalised)")
-    ax.set_title(f"Top {len(scan['best'])} spectra by AFC comb quality "
-                 f"({scan['tag']})")
+    ax.set_title(f"Best spectrum at the top {len(scan['best'])} storage times "
+                 f"by {_metric_label(scan)} ({scan['tag']})")
     if legend:
         ax.legend(fontsize=7, loc="upper right")
     if save:
         ax.figure.savefig(save)
     return ax, lines, labels
+
+
+def plot_top_spectrum(ax, scan, rank, *, save=None):
+    """
+    One kept spectrum on its own - ``scan["best"][rank]`` - with the unburned
+    level dashed in for reference. The single-spectrum counterpart of
+    :func:`plot_top_spectra`, whose overlay gets unreadable past a handful.
+    """
+    p = settings(scan["params"])
+    r = scan["best"][rank]
+    ax.axhline(p["alpha"], color="0.5", lw=0.8, ls="--")
+    ax.plot(r["f"], r["spec"], lw=0.7, color="C0")
+    ax.set_xlabel("Frequency (MHz)")
+    ax.set_ylabel("Absorption (Normalised)")
+    ax.set_title(f"#{rank + 1}: t_s {r['storage_us']:.3g} $\\mu$s, "
+                 f"F {r['finesse']:.1f}{_measured_note(r)}, "
+                 f"{_metric_label(scan)} "
+                 f"{r['quality']:.3f} ({scan['tag']})")
+    if save:
+        ax.figure.savefig(save)
+    return ax
+
+
+def save_top_spectrum_figures(scan, out_dir, *, dpi=200):
+    """
+    Write one PNG per kept spectrum (:func:`plot_top_spectrum`) into
+    ``out_dir``, named by rank, storage time and finesse - e.g.
+    ``01_ts2.5us_F8.0.png`` - and return the paths written.
+
+    PNGs already in ``out_dir`` are removed first, so re-collecting at a
+    smaller ``top_n`` does not leave stale images from the old ranking behind.
+    One Figure is reused and cleared between spectra rather than a fresh one
+    each: at a fine mesh the Agg backend's path buffers run to tens of MB per
+    figure, and this keeps only one alive at a time.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    for name in os.listdir(out_dir):
+        if name.endswith(".png"):
+            os.remove(os.path.join(out_dir, name))
+    best = scan.get("best") or []
+    if not best:
+        return []
+    from matplotlib.figure import Figure
+    width = len(str(len(best)))
+    paths = []
+    fig = Figure(figsize=(8, 4), constrained_layout=True)
+    for rank, r in enumerate(best):
+        fig.clear()
+        plot_top_spectrum(fig.add_subplot(111), scan, rank)
+        path = os.path.join(
+            out_dir, f"{rank + 1:0{width}d}_ts{r['storage_us']:.4g}us_"
+                     f"F{r['finesse']:.3g}.png")
+        fig.savefig(path, dpi=dpi)
+        paths.append(path)
+    del fig
+    return paths
+
+
+#: The whole-scan figures, as ``(name, plot function)``: what
+#: :func:`write_run_outputs` saves under ``figures/`` (and the GUI's export as
+#: ``<prefix>_<name>.png``). Each draws onto a supplied ``Axes``.
+SCAN_FIGURES = (("heatmap", plot_scan_heatmap),
+                ("measured_finesse", plot_scan_measured_finesse),
+                ("finesse_written_vs_measured", plot_finesse_written_vs_measured),
+                ("quality_vs_storage", plot_scan_max),
+                ("topspectra", plot_top_spectra))
 
 
 # ===========================================================================
@@ -3396,11 +4078,13 @@ def plot_scan_heatmap_plotly(scan):
     storage_vals, finesse_vals, z = _scan_grids(scan)
     fig = go.Figure(data=go.Heatmap(
         x=storage_vals, y=finesse_vals, z=z, zmin=0.0,
-        colorscale="Inferno", colorbar=dict(title="AFC comb quality"),
+        colorscale="Inferno",
+        colorbar=dict(title=_metric_label(scan, tex=False)),
         hovertemplate="storage %{x:.3g} us<br>finesse %{y:.1f}"
                       "<br>quality %{z:.3f}<extra></extra>"))
     fig.update_layout(
-        title=f"AFC comb quality over the central {scan['target_window']:g} MHz  "
+        title=f"{_metric_label(scan, tex=False)} over the central "
+              f"{scan['target_window']:g} MHz  "
               f"({scan['tag']})",
         xaxis_title="Storage time (us)",
         yaxis_title="Finesse (tooth spacing / tooth width)",
@@ -3441,9 +4125,10 @@ def plot_scan_max_plotly(scan):
                     line=dict(color="#2C7A7B", width=2)),
         name=f"best: {storage_vals[i]:.3g} us", hoverinfo="skip"))
     fig.update_layout(
-        title=f"AFC comb quality vs storage time - best / mean / worst "
-              f"({scan['tag']})",
-        xaxis_title="Storage time (us)", yaxis_title="AFC comb quality",
+        title=f"{_metric_label(scan, tex=False)} vs storage time - "
+              f"best / mean / worst ({scan['tag']})",
+        xaxis_title="Storage time (us)",
+        yaxis_title=_metric_label(scan, tex=False),
         yaxis=dict(rangemode="tozero"), template="plotly_white")
     return fig
 
@@ -3460,8 +4145,8 @@ def plot_top_spectra_plotly(scan):
             name=f"quality {r['quality']:.3f} | t_s {r['storage_us']:.3g} us, "
                  f"F {r['finesse']:.1f}"))
     fig.update_layout(
-        title=f"Top {len(scan['best'])} spectra by AFC comb quality "
-              f"({scan['tag']})",
+        title=f"Best spectrum at the top {len(scan['best'])} storage times by "
+              f"{_metric_label(scan, tex=False)} ({scan['tag']})",
         xaxis_title="Frequency (MHz)", yaxis_title="Absorption (normalised)",
         template="plotly_white")
     return fig
@@ -3530,6 +4215,18 @@ def _cli_load_config(path):
     return params_from_json(json.dumps(data))
 
 
+def _storage_sep_arg(text):
+    """``--min-storage-sep``: ``auto`` or a non-negative gap in us."""
+    if text.strip().lower() == "auto":
+        return "auto"
+    import argparse
+    try:
+        return _resolve_storage_sep(float(text), 0.0, 0.0, 1)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"expected 'auto' or a gap >= 0 in us, not {text!r}") from exc
+
+
 def _cli_scan(args):
     # Imported by name rather than used as the running __main__ module, so
     # that everything the Pool pickles (compute_one, _init_worker, ...)
@@ -3555,6 +4252,7 @@ def _cli_scan(args):
         params=params, burn=burn, parallel=not args.serial,
         n_workers=args.workers, sim_dir=args.sim_dir, resume=args.resume,
         checkpoint_every=args.checkpoint_every,
+        min_storage_sep=args.min_storage_sep,
         on_done=_shb.scan_teams_notifier())
     print(f"[{scan['tag']}] {scan['state']}: {scan['n_done']}/{scan['n_total']} "
          f"burns, {len(scan['results'])} results, {len(scan['best'])} kept "
@@ -3563,7 +4261,8 @@ def _cli_scan(args):
 
 def _cli_collect(args):
     import shb as _shb
-    best = _shb.collect_top(args.sim_dir, top_n=args.top_n)
+    best = _shb.collect_top(args.sim_dir, top_n=args.top_n,
+                            min_storage_sep=args.min_storage_sep)
     scan = _shb.load_run(args.sim_dir)
     _shb.write_run_outputs(args.sim_dir, scan)
     print(f"collected {len(best)} spectra, wrote results.csv / best.json / "
@@ -3609,7 +4308,12 @@ def _main(argv=None):
     sc.add_argument("--finesse-max", type=float, required=True)
     sc.add_argument("--n-finesse", type=int, required=True)
     sc.add_argument("--target-window", type=float, default=None)
-    sc.add_argument("--top-n", type=int, default=50)
+    sc.add_argument("--top-n", type=int, default=50,
+                    help="keep the best-finesse spectrum at this many of the "
+                    "best storage times (default 50)")
+    sc.add_argument("--min-storage-sep", type=_storage_sep_arg, default="auto",
+                    help="minimum gap (us) between kept storage times, or "
+                    "'auto' (default: spread across the range); 0 = off")
     sc.add_argument("--pump-passes", type=int, default=None,
                     help="default: whatever the params/preset carries")
     sc.add_argument("--burn", choices=("parallel", "series"), default="parallel")
@@ -3629,7 +4333,12 @@ def _main(argv=None):
                         help="(re-)collect the top spectra from a run's "
                         "checkpoint, without re-sweeping")
     co.add_argument("--sim-dir", required=True)
-    co.add_argument("--top-n", type=int, default=None)
+    co.add_argument("--top-n", type=int, default=None,
+                    help="how many storage times to collect the best spectrum "
+                    "for (default: the run's own setting)")
+    co.add_argument("--min-storage-sep", type=_storage_sep_arg, default=None,
+                    help="minimum gap (us) between kept storage times, 'auto', "
+                    "or 0 = off (default: the run's own setting)")
 
     st = sub.add_parser("status", help="how far a simulation folder has got")
     st.add_argument("--sim-dir", required=True)

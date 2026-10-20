@@ -63,14 +63,16 @@ print(out["spec"].min(), out["spec"].max())
 ### Crystal presets
 
 `shb.PRESETS` (GUI: the crystal dropdown) holds ready-made configurations. The
-default `Pr:YSO (site 1, tuned)` uses the Nilsson/Sharma branching matrix; the
-others are transcribed from the original MATLAB source
-(`zenodo.org/records/16962167`):
+default `Pr:YSO (site 1, tuned)` uses the Nilsson/Sharma branching matrix;
+`1.4% Pr:LaWO` (1.4% Pr:La2(WO4)3) uses directly supplied levels and linewidths with a
+uniform placeholder `dm`; the others are transcribed from the original MATLAB
+source (`zenodo.org/records/16962167`):
 
 | preset | levels | `dm` | h_width / in_width | window |
 | --- | --- | --- | --- | --- |
 | `Pr:YSO (site 1, tuned)` | 3 g / 3 e | measured 3×3 | 0.001 / 10000 | ±50 |
 | `Pr:YSO (MATLAB source)` | 3 g / 3 e | uniform | 0.02 / 2000 | ±200 |
+| `1.4% Pr:LaWO` | 3 g / 3 e | uniform | 0.0253 / 18800 | ±100 |
 | `151Eu:YSO (site 1)` | 3 g / 3 e | uniform | 0.1 / 2000 | ±1000 |
 | `171Yb:YSO (site 2)` | 4 g / 4 e | 4×4 (D2 axis) | 0.5 / 1000 | −2000 … 10000 |
 | `Zeeman doublet` | 2 g / 2 e | uniform | 0.1 / 2000 | ±1000 |
@@ -87,27 +89,49 @@ Four ways to use it, mirrored by the GUI's **mode** selector:
    finesse_max, n_finesse, target_window, top_n, pump_passes, ...)` sweeps AFC
    **storage time** x comb **finesse** (`F = tooth_spacing / tooth_width`) and
    scores each spectrum by its **AFC comb quality** over the central
-   `target_window` - `mean_j(v_j) * uniformity * purity`, where `v_j` is the
-   robust per-tooth-period depth (5th/95th percentiles), `uniformity` penalises
-   tooth-to-tooth height scatter, and `purity` is the fraction of the windowed
-   AC power sitting in the fundamental comb period (a single-bin DFT at the known
-   tooth spacing). Each factor is in `[0, 1]`, so a comb has to be deep *and*
-   regular *and* spectrally clean to score well - a plain Michelson visibility
-   cannot separate a clean broadband comb from a deep-but-messy one. **Scores are
-   not comparable to runs made before this change.** Keeps the top *N*. Both
+   `target_window` - `mean_j(v_j) * uniformity * periodicity * squareness *
+   background * finesse_match`, where `v_j` is the robust per-tooth-period
+   depth (5th/95th percentiles), `uniformity` penalises tooth-to-tooth scatter,
+   `periodicity` is the fraction of the windowed AC power at harmonics of the
+   comb period, `squareness` penalises ringing / sub-structure inside a tooth,
+   `background = exp(-d0)` charges the absorption `d0` left in the gaps (the
+   mean below half height - it absorbs input light that is never rephased), and
+   `finesse_match = min(F_a, F_w) / max(F_a, F_w)` compares the written finesse
+   `F_w` (the scan's finesse axis) with the finesse `F_a` the burned comb
+   actually has (from its half-height duty cycle - broadening often spreads a
+   comb written at F = 10 to F ~ 2). Each factor is in `[0, 1]`, so a comb has
+   to be deep, regular, periodic, square, empty between its teeth *and* as fine
+   as written to score well. The spectrum is in `alpha` units, so `background`
+   is the physical AFC `exp(-d0)` loss only when `alpha` is set to the
+   crystal's real optical depth. **Scores are not comparable across
+   `QUALITY_VERSION`s** (currently 3), and resuming an older simulation
+   folder is refused. Keeps the best-finesse
+   spectrum at each of the top *N* storage times (never two spectra at the same
+   storage time), picked best first and kept at least `min_storage_sep` µs
+   apart so they are distinct combs rather than one cluster of near-identical
+   neighbours - `"auto"` (default) is `(storage_max - storage_min) / (2N)`,
+   `0` turns it off, and a wide gap can keep fewer than *N*. Both
    grids are **linear**: `n_points`
    storage times (µs) evenly across `[storage_min, storage_max]` and `n_finesse`
    finesse values evenly across their range, so the heatmap axes are uniformly
-   spaced. Each cell keeps its requested `(storage_us, finesse)`; the burn behind
-   it uses the tooth spacing `1 / t` MHz rounded to the `df` mesh (so any
-   `n_points` works - nothing has to divide `df` evenly). `results` are dicts
-   `{spacing_MHz, width_MHz, finesse, storage_us, quality}` where `spacing_MHz`
-   is the mesh-snapped value actually burned. The tooth spacing `1/t` is
-   quantised to the mesh, so two close storage times can round to the same comb.
-   `run_scan` handles this itself: if the requested `n_points` cannot be resolved
-   at the config `df`, it **refines `df`** by a whole factor (so it still divides
-   the crystal levels and window edges) until every requested storage time lands
-   on a distinct comb, bounded below by what is physically meaningful (~
+   spaced. Each cell keeps its requested `(storage_us, finesse)`, and the burn
+   behind it has a mean tooth period of exactly `1 / t` MHz: the period is a
+   fractional number of `df` steps and each tooth starts on the nearest mesh bin
+   (`shb.period_steps` / `shb.comb`), so the storage times actually burned are
+   as evenly spaced as the ones requested - rounding the period itself to the
+   mesh would bunch them at short `t` and leave gaps growing as `t² · df` at
+   long `t`. `results` are dicts
+   `{spacing_MHz, width_MHz, finesse, storage_us, quality, measured_finesse}`:
+   `finesse` is the written `F_w` you asked for (the heatmap's axis), and
+   `measured_finesse` the `F_a` the burned comb actually came out with - the
+   same number `finesse_match` uses, recorded per cell (and per kept spectrum
+   in `best`) so you can see how far broadening pulled the comb from what was
+   written. It is `nan` where no whole period fits the window, and for cells
+   resumed from a folder checkpointed before it was recorded. The price of a
+   fractional period is that each tooth sits up to `df/2` off its ideal
+   position, so `run_scan` **refines `df`** by a whole factor (so it still divides
+   the crystal levels and window edges) until neighbouring storage times differ
+   by at least one mesh step of tooth spacing, bounded below by what is physically meaningful (~
    `h_width/5`) and by a spectrum-array-size cap. The refined value is returned
    as `df_used` and both the refinement and any remaining unresolved points are
    logged. A finer mesh means slower burns - the up-front time estimate reflects
@@ -195,8 +219,14 @@ cells. The folder also carries `manifest.json` (the settings a resume is
 checked against - `df_used`, the crystal, the window, pump passes, the burn
 mode - refused with a diff if they no longer match), `status.json` (a live
 "how far in" view, and the run's lock - two processes cannot write the same
-folder at once), and, once a sweep finishes, `results.csv`, `best.json` +
-`top_spectra.npy` and `figures/*.png`. `shb.load_run(sim_dir)` reads a folder
+folder at once), and, once a sweep finishes, `results.csv`
+(`shb.RESULTS_COLUMNS`, the `results` keys above), `best.json` +
+`top_spectra.npy` and `figures/*.png` (`shb.SCAN_FIGURES`; plus one image per
+kept spectrum in `figures/top_spectra/`). Each `progress.csv` row carries the
+burn's score and its measured finesse; a folder written before that column
+existed still resumes - its old rows read as `measured_finesse = nan`, new rows
+are appended with it, and the kept spectra are measured directly when they are
+collected. `shb.load_run(sim_dir)` reads a folder
 back - complete, cancelled, or crashed - into the same dict `run_scan` returns;
 `shb.inspect_run(sim_dir)` is a cheap summary for a GUI to poll;
 `shb.collect_top(sim_dir)` (re-)burns the top spectra from the checkpoint alone,
@@ -264,7 +294,8 @@ The left column has two tabs.
 - **Simulation Parameters** - `fmin`/`fmax`/`df`, `h_width`/`in_width`,
   `pump_passes`, burn mode, `alpha`, the mode selector and its fields (Scan:
   storage-time min/max (µs) + **storage-time points**, finesse min/max +
-  **finesse points**, target window, keep top N, multiprocessing on by default;
+  **finesse points**, target window, keep top N storage times, min storage separation
+  (auto or µs), multiprocessing on by default;
   Preparation sequence: an *Edit sequence…* dialog - a table of pulse rows, the
   GEM / narrowband-AFC presets with their parameters, and add / remove / reorder
   buttons, since the row order is the burn order),
@@ -280,8 +311,8 @@ from the run), then *Export…* picks the folder. Written files, for prefix `P`:
 | --- | --- | --- |
 | run log | `P_runlog.txt` | `P_runlog.txt` |
 | config | `P_config.json` (`{params, gui}`) | same |
-| figures | `P_plot.png` | `P_plot.png` + `P_heatmap.png`, `P_quality_vs_storage.png`, `P_topspectra.png` |
-| data | `P_spectrum.npy` (`vstack[f,spec]`), `P_spectrum.csv` | `P_results.csv` (`spacing_MHz,width_MHz,finesse,storage_us,quality`), `P_top_spectra.npy` (row 0 = `f`, then each kept spectrum), `P_scan.pkl` |
+| figures | `P_plot.png` | `P_plot.png` + `P_heatmap.png`, `P_measured_finesse.png`, `P_finesse_written_vs_measured.png`, `P_quality_vs_storage.png`, `P_topspectra.png`, `P_top_spectra/` (one PNG per kept spectrum) |
+| data | `P_spectrum.npy` (`vstack[f,spec]`), `P_spectrum.csv` | `P_results.csv` (`spacing_MHz,width_MHz,finesse,storage_us,quality,measured_finesse`), `P_top_spectra.npy` (row 0 = `f`, then each kept spectrum), `P_scan.pkl` |
 
 Right column: one figure with the **pump comb** on top and the **spectrum**
 below, sharing the Frequency axis. A preparation sequence draws the top panel as
@@ -290,8 +321,14 @@ one band per stage, stacked in burn order and labelled on the y-axis - **left-dr
 or use the toolbar. A scan replaces both with a single full-height view: the
 **AFC comb-quality heatmap** over storage time (`1/tooth_spacing`, µs) x finesse
 (`tooth_spacing/tooth_width`), *quality vs storage time* (best / mean / worst over
-finesse at each storage time), or *top spectra* - chosen by the *Scan view*
-dropdown. In the top-spectra view the legend is a scrollable side panel of
+finesse at each storage time), *top spectra*, a **measured-finesse heatmap**
+(the finesse each burned comb actually has, on the same storage x written-finesse
+grid as the quality heatmap), or a *measured vs written finesse* scatter
+(coloured by quality, with the `F_a = F_w` line for reference) - chosen by the
+*Scan view* dropdown. The best-comb legend, the top-spectra labels and the run
+log quote the measured finesse next to the written one, e.g. `F 10.0 (measured
+2.1)`. The two measured-finesse views show a note instead of a plot for a scan
+saved before measured finesse was recorded. In the top-spectra view the legend is a scrollable side panel of
 per-trace checkboxes; toggling one hides that spectrum and rescales the y-axis to
 what is left. Below is the **Simulation run log**, whose lines are stamped
 `[dd:mm:yyyy hh:mm:ss]` and, during a run, carry the elapsed time and a periodic
