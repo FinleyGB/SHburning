@@ -12,7 +12,7 @@ Layout
     Core        to_steps, build_transitions, make_axes, initial_populations,
                 burn_parallel, burn_series, spectrum, run_burn,
                 normalisation_factor
-    Combs       comb, comb_at, single_hole
+    Combs       comb, comb_for, comb_at, single_hole
     Scan        compute_one, run_scan  (serial or multiprocessing)
     Plotting    matplotlib helpers that draw onto a supplied Axes, plus a few
                 plotly builders kept for the notebooks' standalone HTML exports
@@ -69,7 +69,7 @@ __all__ = [
     "burn_parallel", "burn_series", "spectrum", "run_burn",
     "burn_sequence", "run_sequence", "normalisation_factor", "Cancelled",
     # combs / preparation sequences
-    "comb", "comb_at", "comb_in", "single_hole",
+    "comb", "comb_steps", "comb_for", "comb_at", "comb_in", "single_hole",
     "pulse_group", "sequence_stages", "anti_hole_pumps",
     "peak_shadow_bands", "default_pit_width",
     "prep_gem", "prep_narrowband_afc", "prep_broadband_afc", "PREP_PRESETS",
@@ -84,7 +84,7 @@ __all__ = [
     "RESULTS_COLUMNS",
     # plotting (matplotlib, draw onto an Axes)
     "plot_spectrum", "plot_comb", "plot_sequence", "plot_populations",
-    "plot_scan_heatmap", "plot_scan_measured_finesse",
+    "plot_level_diagram", "plot_scan_heatmap", "plot_scan_measured_finesse",
     "plot_finesse_written_vs_measured", "plot_scan_max", "plot_top_spectra",
     "plot_top_spectrum", "save_top_spectrum_figures", "SCAN_FIGURES",
     # plotting (plotly, return a Figure)
@@ -248,6 +248,36 @@ PRESETS = {
         g=[0.0, -14.87, -39.31], e=[0.0, 4.94, 12.17],
         dm=np.full((3, 3), 1 / 3), h_width=0.0253, in_width=18800.0,
         fmin=-100.0, fmax=100.0, df=0.01),
+
+    # 500 ppm Pr:CaWO4 - Yang et al., Phys. Rev. A 107, 022802 (2023). The
+    # splittings are measured (ground 50.3 / 99.3 MHz, excited 4.2 / 6.4 MHz,
+    # Fig. 4) but their ordering is only inferred, from dual-frequency hole
+    # burning (Fig. 6): (a)/(b) are the two candidate ground orderings, (d)/(e)
+    # the two excited ones. All four combinations are offered; the paper
+    # concludes (b) + (e). h_width = 1/(pi T2) with T2 = 74.2 us at 1.7 K;
+    # in_width is the 85.46 GHz optical FWHM (fitted as a Lorentzian in the
+    # paper, Gaussian here - immaterial at this width). dm is a uniform
+    # placeholder: no branching ratios were measured. The levels are given to
+    # 0.1 MHz; df = 0.01 keeps the mesh at ~2 bins per homogeneous linewidth.
+    "Pr:CaWO4 (Fig. 6a+d)": _preset(
+        g=[0.0, -99.3, -149.6], e=[0.0, 4.2, 10.6],
+        dm=np.full((3, 3), 1 / 3), h_width=0.00428, in_width=85460.0,
+        fmin=-200.0, fmax=200.0, df=0.01),
+
+    "Pr:CaWO4 (Fig. 6a+e)": _preset(
+        g=[0.0, -99.3, -149.6], e=[0.0, 6.4, 10.6],
+        dm=np.full((3, 3), 1 / 3), h_width=0.00428, in_width=85460.0,
+        fmin=-200.0, fmax=200.0, df=0.01),
+
+    "Pr:CaWO4 (Fig. 6b+d)": _preset(
+        g=[0.0, -50.3, -149.6], e=[0.0, 4.2, 10.6],
+        dm=np.full((3, 3), 1 / 3), h_width=0.00428, in_width=85460.0,
+        fmin=-200.0, fmax=200.0, df=0.01),
+
+    "Pr:CaWO4 (Fig. 6b+e, paper)": _preset(
+        g=[0.0, -50.3, -149.6], e=[0.0, 6.4, 10.6],
+        dm=np.full((3, 3), 1 / 3), h_width=0.00428, in_width=85460.0,
+        fmin=-200.0, fmax=200.0, df=0.01),
 
     "151Eu:YSO (site 1)": _preset(
         g=[0.0, -34.5, -80.7], e=[0.0, 75.0, 176.6],
@@ -863,6 +893,45 @@ def period_steps(storage_time, df):
     if abs(s - k) < 1e-6:
         return int(max(1, k))
     return max(1.0, s)
+
+
+def comb_steps(storage_time, finesse, df):
+    """
+    The ``(spacing_steps, width_steps)`` of the comb for a storage time of
+    ``storage_time`` us and a finesse of ``finesse``.
+
+    The spacing is :func:`period_steps` (possibly fractional); the tooth width
+    is ``spacing / finesse`` rounded to a whole step, never below one step nor
+    wider than the period. This is the one rule :func:`run_scan` and
+    :func:`comb_for` share, so a scan cell's ``(t, F)`` re-burned as a single
+    comb is the same burn.
+    """
+    s = period_steps(storage_time, df)
+    w = int(max(1, min(int(s), round(s / finesse))))
+    return s, w
+
+
+def comb_for(storage_time, finesse, params):
+    """
+    A comb across the whole config window for a storage time of
+    ``storage_time`` us and a finesse of ``finesse`` - the experimentally
+    meaningful pair, rather than the tooth spacing and width themselves.
+
+    Mapped to the mesh by :func:`comb_steps` and burned by :func:`comb`, so
+    neither value needs to land on the ``df`` mesh: the storage time is
+    honoured exactly on average (a fractional period), the finesse to the
+    nearest whole step of tooth width.
+
+    Returns
+        freqs           the pump frequencies (MHz), exactly on the mesh
+        actual_storage  the storage time the mean period gives (us)
+        actual_finesse  the spacing over the mesh-snapped tooth width
+        n_teeth         how many teeth fitted in the window
+    """
+    df = settings(params)["df"]
+    s, w = comb_steps(storage_time, finesse, df)
+    freqs = comb(s, w, params)
+    return freqs, 1.0 / (s * df), s / w, freqs.size // w
 
 
 def comb_at(tooth_spacing, burn_width, params):
@@ -2348,7 +2417,7 @@ def run_scan(storage_min, storage_max, n_points,
         s = period_steps(t, df)
         distinct_spacings.add(s)
         for F in finesse_vals:
-            w = int(max(1, min(int(s), round(s / F))))
+            _, w = comb_steps(t, F, df)
             requested.append((float(t), float(F), s, w))
             todo.setdefault((s, w), len(todo))
     uniq = list(todo)       # unique (s_steps, w_steps), in first-seen order
@@ -3786,6 +3855,88 @@ def plot_populations(ax, out, *, title="Ion classes addressed by the burn",
     if title:
         ax.set_title(title)
     ax.legend()
+    return ax
+
+
+def plot_level_diagram(ax, g, e, dm=None, *, title=None):
+    """
+    The hyperfine level structure: ground manifold below, excited above, in
+    the style of the usual hole-burning level diagrams (e.g. Yang et al.,
+    PRA 107, 022802, Fig. 6).
+
+    The two manifolds are drawn on **separate scales** - each is stretched to
+    fill its own band - because their spans differ by an order of magnitude
+    (Pr:CaWO4: ~150 MHz ground, ~11 MHz excited) and the optical gap between
+    them by another nine. Spacings are therefore to scale *within* a
+    manifold only; the labelled arrows give the real gaps in MHz.
+
+    Levels are labelled ``g0``, ``g1``, ... / ``e0``, ... by their index in
+    ``g`` / ``e``, i.e. the row/column of ``dm``. When ``dm`` is given, each
+    ``g_k -> e_m`` transition is a vertical line whose weight and opacity
+    scale with ``dm[k, m]`` relative to the strongest; zero entries are not
+    drawn, and a uniform ``dm`` gives equal lines.
+    """
+    g = np.asarray(g, dtype=float)
+    e = np.asarray(e, dtype=float)
+
+    def band(vals, base):
+        lo, hi = vals.min(), vals.max()
+        if hi == lo:
+            return np.full(vals.shape, base + 0.5)
+        return base + 0.1 + 0.8 * (vals - lo) / (hi - lo)
+
+    def num(v):
+        return f"{round(float(v), 6):g}"
+
+    y_g, y_e = band(g, 0.0), band(e, 2.0)
+    x0, x1 = 0.22, 0.80
+
+    if dm is not None:
+        dm = np.asarray(dm, dtype=float)
+        top = dm.max() if dm.size and dm.max() > 0 else 1.0
+        n = len(g) * len(e)
+        xs = np.linspace(x0 + 0.04, x1 - 0.04, n) if n > 1 else [0.5 * (x0 + x1)]
+        for i, (k, m) in enumerate((k, m) for k in range(len(g))
+                                   for m in range(len(e))):
+            w = dm[k, m] / top
+            if w <= 0:
+                continue
+            ax.plot([xs[i], xs[i]], [y_g[k], y_e[m]], color="0.35",
+                    lw=0.4 + 2.6 * w, alpha=0.2 + 0.7 * w,
+                    solid_capstyle="butt", zorder=1)
+
+    for vals, ys, name, colour, base in ((g, y_g, "g", "C0", 0.0),
+                                         (e, y_e, "e", "C1", 2.0)):
+        for i, (v, y) in enumerate(zip(vals, ys)):
+            ax.plot([x0, x1], [y, y], color=colour, lw=2.0, zorder=3)
+            ax.text(x0 - 0.02, y, f"{name}{i}  {num(v)}", ha="right",
+                    va="center", fontsize=8)
+        order = np.argsort(ys)
+        for a, b in zip(order, order[1:]):
+            if ys[b] == ys[a]:
+                continue
+            ax.annotate("", xy=(x1 + 0.06, ys[b]), xytext=(x1 + 0.06, ys[a]),
+                        arrowprops=dict(arrowstyle="<->", lw=0.8,
+                                        shrinkA=0, shrinkB=0))
+            ax.text(x1 + 0.08, 0.5 * (ys[a] + ys[b]),
+                    f"{num(abs(vals[b] - vals[a]))} MHz",
+                    ha="left", va="center", fontsize=8)
+        if name == "g":
+            ax.text(0.5 * (x0 + x1), base + 0.03, "ground", ha="center",
+                    va="top", fontsize=9, color=colour)
+        else:
+            ax.text(0.5 * (x0 + x1), base + 0.97, "excited", ha="center",
+                    va="bottom", fontsize=9, color=colour)
+
+    ax.text(0.5 * (x0 + x1), 1.5, "optical transition (not to scale)",
+            ha="center", va="center", fontsize=8, color="0.4", zorder=4,
+            bbox=dict(boxstyle="round,pad=0.3", fc=ax.get_facecolor(),
+                      ec="none"))
+    ax.set_xlim(-0.02, 1.12)
+    ax.set_ylim(-0.12, 3.12)
+    ax.set_axis_off()
+    if title:
+        ax.set_title(title)
     return ax
 
 

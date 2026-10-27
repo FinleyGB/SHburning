@@ -65,14 +65,19 @@ print(out["spec"].min(), out["spec"].max())
 `shb.PRESETS` (GUI: the crystal dropdown) holds ready-made configurations. The
 default `Pr:YSO (site 1, tuned)` uses the Nilsson/Sharma branching matrix;
 `1.4% Pr:LaWO` (1.4% Pr:La2(WO4)3) uses directly supplied levels and linewidths with a
-uniform placeholder `dm`; the others are transcribed from the original MATLAB
-source (`zenodo.org/records/16962167`):
+uniform placeholder `dm`; the four `Pr:CaWO4 (Fig. 6…)` presets (500 ppm
+Pr:CaWO4, Yang et al., PRA 107, 022802 (2023)) share measured splittings but
+cross the paper's two candidate ground orderings (Fig. 6a/b) with its two
+candidate excited orderings (Fig. 6d/e) - `6b+e` is the authors' conclusion;
+the others are transcribed from the original MATLAB source
+(`zenodo.org/records/16962167`):
 
 | preset | levels | `dm` | h_width / in_width | window |
 | --- | --- | --- | --- | --- |
 | `Pr:YSO (site 1, tuned)` | 3 g / 3 e | measured 3×3 | 0.001 / 10000 | ±50 |
 | `Pr:YSO (MATLAB source)` | 3 g / 3 e | uniform | 0.02 / 2000 | ±200 |
 | `1.4% Pr:LaWO` | 3 g / 3 e | uniform | 0.0253 / 18800 | ±100 |
+| `Pr:CaWO4 (Fig. 6a+d / 6a+e / 6b+d / 6b+e, paper)` | 3 g / 3 e | uniform | 0.00428 / 85460 | ±200 |
 | `151Eu:YSO (site 1)` | 3 g / 3 e | uniform | 0.1 / 2000 | ±1000 |
 | `171Yb:YSO (site 2)` | 4 g / 4 e | 4×4 (D2 axis) | 0.5 / 1000 | −2000 … 10000 |
 | `Zeeman doublet` | 2 g / 2 e | uniform | 0.1 / 2000 | ±1000 |
@@ -83,8 +88,10 @@ fields when you pick it. The core handles any square `n×n` level structure.
 Four ways to use it, mirrored by the GUI's **mode** selector:
 
 1. **Single hole** - one pump frequency, burned `pump_passes` times.
-2. **One comb** - a comb of teeth (`tooth_spacing`, `burn_width` in MHz), snapped
-   to the mesh by `comb_at`.
+2. **One comb** - an AFC set by its **storage time** (us) and **finesse**,
+   mapped to the mesh by `comb_for` with the same rule a scan cell uses
+   (`comb_steps`), so a scan winner's `(t, F)` re-burns identically. (`comb_at`
+   still builds a comb from a tooth spacing and burn width in MHz.)
 3. **Scan** - `run_scan(storage_min, storage_max, n_points, finesse_min,
    finesse_max, n_finesse, target_window, top_n, pump_passes, ...)` sweeps AFC
    **storage time** x comb **finesse** (`F = tooth_spacing / tooth_width`) and
@@ -148,6 +155,28 @@ Four ways to use it, mirrored by the GUI's **mode** selector:
 4. **Preparation sequence** - an ordered list of burning pulses, for the
    features a single comb cannot make: a GEM peak, a narrowband AFC. See
    *Preparation sequences* below.
+
+### AFC comb quality
+
+The score above is `shb._score_quality_and_finesse(f, spec, target_window,
+spacing_mhz, width_mhz)`, which returns `(Q, F_a)`; `_score_quality` is the
+score-only wrapper. A window with fewer than two whole tooth periods has no
+comb to measure, so it falls back to the whole-window depth and `F_a = nan`.
+
+```mermaid
+flowchart TD
+    A["Crop spectrum<br/>centre ± target_window / 2"] --> B["Whole-window depth<br/>from p05 / p95 percentiles"]
+    B --> C{"At least 2 whole<br/>tooth periods?<br/>per = spacing_mhz / df"}
+    C -- no --> X["Return fallback<br/>(depth · exp(−p05), nan)"]
+    C -- yes --> D["Reshape into periods<br/>n_per × per chunks, averaged template"]
+    D --> F1["Mean depth<br/>mean of v_j"]
+    D --> F2["Uniformity<br/>1 − std(v_j) / mean(v_j)"]
+    D --> F3["Periodicity<br/>FFT power<br/>at harmonics"]
+    D --> F4["Squareness<br/>no extra bumps<br/>in a tooth"]
+    D --> F5["Background<br/>exp(−mean<br/>gap depth)"]
+    D --> F6["Finesse match<br/>min(F_a, F_w) /<br/>max(F_a, F_w)"]
+    F1 & F2 & F3 & F4 & F5 & F6 --> Q["Q = product of all six factors, each in [0, 1]<br/>clip to [0, 1], return (Q, F_a)"]
+```
 
 ### Preparation sequences
 
@@ -290,7 +319,9 @@ The left column has two tabs.
 - **Crystal parameters** - the crystal-preset dropdown (see *Crystal presets*
   above; picking one loads its levels, linewidths and a suggested window/mesh),
   a *Relative dipole strength* toggle (off = every transition equally strong),
-  and an *Edit levels…* dialog for `g` / `e` / `dm`.
+  and an *Edit levels…* dialog for `g` / `e` / `dm`, which draws the level
+  structure (`shb.plot_level_diagram`) live as you edit, with each
+  transition weighted by its `dm` entry.
 - **Simulation Parameters** - `fmin`/`fmax`/`df`, `h_width`/`in_width`,
   `pump_passes`, burn mode, `alpha`, the mode selector and its fields (Scan:
   storage-time min/max (µs) + **storage-time points**, finesse min/max +

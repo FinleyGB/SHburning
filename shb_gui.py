@@ -574,15 +574,28 @@ class LevelsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
+        # Level diagram, redrawn live from the tables (shb.plot_level_diagram)
+        self.figure = Figure(figsize=(4, 4.5), constrained_layout=True)
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.canvas.setMinimumSize(340, 380)
+        self.dm_table.itemChanged.connect(self._redraw_levels)
+
+        tables = QVBoxLayout()
+        tables.addWidget(QLabel("Ground levels g"))
+        tables.addWidget(self.g_table)
+        tables.addWidget(self.g_info)
+        tables.addWidget(QLabel("Excited levels e"))
+        tables.addWidget(self.e_table)
+        tables.addWidget(self.e_info)
+        tables.addWidget(QLabel("Branching / relative dipole matrix dm"))
+        tables.addWidget(self.dm_table)
+
+        columns = QHBoxLayout()
+        columns.addLayout(tables, stretch=1)
+        columns.addWidget(self.canvas, stretch=1)
+
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("Ground levels g"))
-        lay.addWidget(self.g_table)
-        lay.addWidget(self.g_info)
-        lay.addWidget(QLabel("Excited levels e"))
-        lay.addWidget(self.e_table)
-        lay.addWidget(self.e_info)
-        lay.addWidget(QLabel("Branching / relative dipole matrix dm"))
-        lay.addWidget(self.dm_table)
+        lay.addLayout(columns)
         lay.addWidget(buttons)
 
         self._update_level_info()
@@ -613,6 +626,19 @@ class LevelsDialog(QDialog):
     def _update_level_info(self, *_):
         self.g_info.setText(self._describe_levels(self.g_table))
         self.e_info.setText(self._describe_levels(self.e_table))
+        self._redraw_levels()
+
+    def _redraw_levels(self, *_):
+        """Redraw the level diagram; a half-typed or empty cell keeps the
+        last good drawing rather than raising mid-edit."""
+        try:
+            crystal = self.values()
+        except ValueError:
+            return
+        self.figure.clear()
+        shb.plot_level_diagram(self.figure.add_subplot(), crystal["g"],
+                               crystal["e"], crystal["dm"])
+        self.canvas.draw_idle()
 
     @staticmethod
     def _vector_table(values):
@@ -1557,17 +1583,21 @@ class MainWindow(QMainWindow):
         # one comb
         oc = QWidget()
         oc_form = QFormLayout(oc)
-        self.tooth_spacing = _dspin(0.001, 1000, max(self.df.value(), 1e-6),
-                                    2.35)
-        self.burn_width = _dspin(0.001, 1000, max(self.df.value(), 1e-6),
-                                 1.18)
-        self.df.valueChanged.connect(self._sync_comb_steps)
-        self.tooth_spacing.valueChanged.connect(self._refresh_comb_preview)
-        self.burn_width.valueChanged.connect(self._refresh_comb_preview)
+        # Storage time and finesse rather than tooth spacing and burn width:
+        # neither needs to sit on the df mesh - shb.comb_for maps them the
+        # same way a scan cell is, so a scan winner re-burns identically here.
+        self.comb_storage = _dspin(0.001, 100000, 0.1, 2.0)
+        self.comb_storage.setToolTip(
+            "AFC storage time, us - teeth 1 / storage time MHz apart.")
+        self.comb_finesse = _dspin(1.0, 1000, 0.5, 2.0)
+        self.comb_finesse.setToolTip(
+            "Comb finesse: tooth spacing / tooth width.")
+        self.comb_storage.valueChanged.connect(self._refresh_comb_preview)
+        self.comb_finesse.valueChanged.connect(self._refresh_comb_preview)
         self.comb_info = QLabel("-")
         self.comb_info.setWordWrap(True)
-        oc_form.addRow("tooth spacing (MHz)", self.tooth_spacing)
-        oc_form.addRow("burn width (MHz)", self.burn_width)
+        oc_form.addRow("storage time (us)", self.comb_storage)
+        oc_form.addRow("finesse", self.comb_finesse)
         oc_form.addRow("on mesh", self.comb_info)
         self.stack.addWidget(oc)
 
@@ -1854,13 +1884,15 @@ class MainWindow(QMainWindow):
         if mode == 0:
             return shb.single_hole(self.centre.value()), "single hole", None
         if mode == 1:
-            freqs, sp, wd, nt = shb.comb_at(
-                self.tooth_spacing.value(), self.burn_width.value(), params)
+            freqs, t_s, fin, nt = shb.comb_for(
+                self.comb_storage.value(), self.comb_finesse.value(), params)
+            sp = 1.0 / t_s
             self.comb_info.setText(
-                f"spacing {sp:g} MHz, width {wd:g} MHz "
-                f"({wd / sp:.0%}), {nt} teeth")
+                f"t_s {t_s:.4g} us, F {fin:.3g} - spacing {sp:.4g} MHz, "
+                f"width {sp / fin:.4g} MHz, {nt} teeth")
             return (freqs,
-                    f"comb: {sp:g} MHz spacing, {wd:g} MHz width, {nt} teeth",
+                    f"comb: t_s {t_s:.4g} us, F {fin:.3g} "
+                    f"({sp:.4g} MHz spacing), {nt} teeth",
                     None)
         if mode == 3:
             stages = shb.sequence_stages(self._sequence_rows, params)
@@ -1882,16 +1914,6 @@ class MainWindow(QMainWindow):
         freqs, sp, wd, nt = shb.comb_at(mid, width, params)
         return freqs, (f"scan preview: t_s {1 / sp:.3g} us, comb at "
                        f"{sp:g} MHz, F {sp / wd:.1f}"), None
-
-    def _sync_comb_steps(self, *_):
-        """Keep tooth_spacing/burn_width spinner steps on the df mesh.
-
-        A fixed step would drift off-mesh as soon as df changes, making it
-        easy to nudge tooth_spacing/burn_width into a value to_steps rejects.
-        """
-        step = max(self.df.value(), 1e-6)
-        self.tooth_spacing.setSingleStep(step)
-        self.burn_width.setSingleStep(step)
 
     def _refresh_comb_preview(self, *_):
         """Live pump-comb preview; the plot returns to preview when inputs change."""
@@ -2120,7 +2142,7 @@ class MainWindow(QMainWindow):
 
     # -- session import / export --------------------------------
 
-    _GUI_FIELDS = ("centre", "tooth_spacing", "burn_width", "storage_min",
+    _GUI_FIELDS = ("centre", "comb_storage", "comb_finesse", "storage_min",
                    "storage_max", "finesse_min", "finesse_max", "target_window")
     _GUI_INTS = ("n_points", "n_finesse", "top_n", "workers")
 
@@ -2181,6 +2203,12 @@ class MainWindow(QMainWindow):
             self.burn_mode.setCurrentText(gui["burn_mode"])
         if "parallel" in gui:
             self.parallel_check.setChecked(bool(gui["parallel"]))
+        # Sessions saved before the One comb inputs became storage time and
+        # finesse carry tooth_spacing/burn_width (MHz) instead.
+        if ("comb_storage" not in gui and gui.get("tooth_spacing")
+                and gui.get("burn_width")):
+            sp, wd = float(gui["tooth_spacing"]), float(gui["burn_width"])
+            gui = {**gui, "comb_storage": 1.0 / sp, "comb_finesse": sp / wd}
         for name in self._GUI_FIELDS:
             if name in gui:
                 getattr(self, name).setValue(float(gui[name]))
@@ -2452,8 +2480,8 @@ class MainWindow(QMainWindow):
                 if label and label not in names:
                     names.append(label)
             return f"df{df:g}_seq_{'-'.join(names) or 'empty'}"
-        return (f"df{df:g}_comb_{self.tooth_spacing.value():g}MHz_"
-                f"{self.burn_width.value():g}MHz")
+        return (f"df{df:g}_comb_{self.comb_storage.value():g}us_"
+                f"F{self.comb_finesse.value():g}")
 
     def _open_export(self):
         if self._last_burn is None and self._scan is None:
